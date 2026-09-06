@@ -56,7 +56,13 @@ SERVICE="${CLOUDRUN_SERVICE:-phidro}"
 BUCKET="${GCS_BUCKET:-phidro-state}"
 MEMORY="${CLOUDRUN_MEMORY:-512Mi}"
 CPU="${CLOUDRUN_CPU:-1}"
-MAX_INSTANCES="${CLOUDRUN_MAX_INSTANCES:-5}"
+# 1 instância, SEMPRE: o _state_lock do backend é por processo e as escritas
+# no bucket não têm precondição de geração — duas instâncias gravando o mesmo
+# catálogo perdem uma das atualizações em silêncio; e a localização ao vivo é
+# um dict em memória (POST numa instância, GET noutra = ninguém no mapa). A
+# concorrência vem das threads do gunicorn (--concurrency=80 enfileira no
+# mesmo processo). O serviço rodou com max=5 até 09/2026 — ver CLAUDE.md.
+MAX_INSTANCES="${CLOUDRUN_MAX_INSTANCES:-1}"
 MIN_INSTANCES="${CLOUDRUN_MIN_INSTANCES:-0}"
 
 DRY=""

@@ -19,8 +19,20 @@ Fatos rápidos:
   humana. Vocabulário `…/terms#<Termo>` (doc inteiro em `/terms`); pessoas
   `…/pessoas/<slug>`; passeios `…/passeio/<slug>`; edições de série
   `…/passeio/<série>/<nº>` (ex.: `…/passeio/BP/4`); séries `…/serie/<código>`;
-  mídia `…/midia/image_<phash>` e `…/midia/video_<vhash>`; listas/álbuns
+  mídia `…/midia/<hash>` (foto ou vídeo — o tipo vem da classe; a forma antiga
+  `…/midia/image_<hash>` / `video_<hash>` ainda resolve); listas/álbuns
   `…/listas/<slug>`. (A Cloudflare faz 303 path-preserving de `id.` p/ `amora`.)
+- **Toda página responde em Markdown**: `Accept: text/markdown` (ou `?format=md`)
+  devolve a mesma URL em Markdown limpo, sem o chrome do app — a home (este
+  guia + os passeios recentes), `/passeio/<slug>` (narrativa + ficha),
+  `/memoria.html` (todos os passeios), `/serie/<código>`, `/pessoas/<slug>`,
+  `/midia/<hash>`, `/listas/<slug>` e `/terms`. HTML continua o padrão pra
+  `*/*` e `text/html`. As respostas trazem `x-markdown-tokens` (estimativa) e
+  `Content-Signal`.
+- Descoberta (RFC 8288 / RFC 9727): as páginas mandam um header `Link` com
+  `rel="api-catalog"` (→ `/.well-known/api-catalog`, linkset JSON),
+  `service-desc` (→ `/openapi.json`), `service-doc` (→ este arquivo) e
+  `describedby` (→ o manifesto VoID).
 - Fotos e clipes são, em geral, licenciados CC BY-SA 4.0 — cada item carrega
   sua própria licença nos triples.
 
@@ -29,8 +41,8 @@ Fatos rápidos:
 - [Manifesto VoID](https://amora.pedalhidrografi.co/data/data_graphs.ttl):
   ponto de entrada; lista todos os dumps via `void:dataDump`.
 - [tours.ttl](https://amora.pedalhidrografi.co/data/tours.ttl): catálogo de
-  passeios (`ph:Tour`) — data, título, participantes, energia estimada
-  (QUDT), link do post no Instagram e da rota no RideWithGPS.
+  passeios (`ph:Tour`) — data, título, participantes, energia estimada e
+  medida (kJ), link do post no Instagram e da rota no RideWithGPS.
 - [images.ttl](https://amora.pedalhidrografi.co/data/images.ttl): fotos
   (`ph:StillImage`) e vídeos (`ph:MotionImage`) georreferenciados — ambos
   subclasses de `ph:Image` (mídia visual) — com hash perceptual, autoria e
@@ -47,9 +59,19 @@ Fatos rápidos:
 
 ## Conteúdo
 
-- [Página principal](https://amora.pedalhidrografi.co/): o mapa.
+- [Página principal](https://amora.pedalhidrografi.co/): o mapa (em Markdown:
+  este guia + os passeios recentes).
+- [Memória Hidrográfica](https://amora.pedalhidrografi.co/memoria.html): todos
+  os passeios com narrativa, mais recentes primeiro (HTML ou Markdown).
 - [feed.xml](https://amora.pedalhidrografi.co/feed.xml): RSS 2.0 com os
   passeios mais recentes.
+
+## API
+
+- [openapi.json](https://amora.pedalhidrografi.co/openapi.json): OpenAPI 3.1
+  da API HTTP de leitura (páginas negociadas, dumps, rotas salvas, feeds).
+- [/.well-known/api-catalog](https://amora.pedalhidrografi.co/.well-known/api-catalog):
+  catálogo de APIs (RFC 9727, linkset JSON).
 
 ## Opcional
 

@@ -328,14 +328,12 @@ async function loadData() {
       new URL('./data/identities.ttl', document.baseURI).href,
     ];
   }
-  const parts = [];
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { cache: 'no-cache' });
-      if (!r.ok) { console.warn(`[pessoas] ${u}: HTTP ${r.status}`); continue; }
-      parts.push(await r.text());
-    } catch (err) { console.warn(`[pessoas] ${u}: ${err.message}`); }
-  }
+  // Em PARALELO (eram N round trips em série), concatenados na ordem.
+  const parts = (await Promise.all(urls.map((u) =>
+    fetch(u, { cache: 'no-cache' })
+      .then((r) => { if (!r.ok) { console.warn(`[pessoas] ${u}: HTTP ${r.status}`); return null; } return r.text(); })
+      .catch((err) => { console.warn(`[pessoas] ${u}: ${err.message}`); return null; })
+  ))).filter((t) => t != null);
   return new N3.Parser().parse(parts.join('\n\n'));
 }
 

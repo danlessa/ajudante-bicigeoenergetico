@@ -344,6 +344,18 @@
 const $  = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+// Boot ainda em curso (imports + catálogo): um arquivo escolhido antes do
+// listener de verdade existir era silenciosamente descartado — o input ficava
+// habilitado e o "change" caía no vazio. Guarda as seleções; o listener real
+// (lá embaixo, handlePickedFiles) as processa assim que o boot terminar.
+window._phidroEarlyPicks = [];
+$('#files')?.addEventListener('change', (e) => {
+  if (!window._phidroEarlyPicks) return;   // boot terminou — o listener real assumiu
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (files.length) window._phidroEarlyPicks.push(files);
+});
+
 // Embutido no iframe do app: o título vive na faixa do header do modal —
 // esconde o <h1> interno pra não duplicar. Standalone mostra normalmente.
 if (window.self !== window.top) $('h1')?.style.setProperty('display', 'none');
@@ -369,17 +381,31 @@ function _loadScript(src) {
 }
 if (!window.TomSelect) await _loadScript('./lib/tom-select.complete.min.js');
 const TomSelect = window.TomSelect;
-let JSZip;
-try {
-  JSZip = (await import('https://esm.sh/jszip@3.10.1')).default;
-} catch (_) { console.warn('JSZip indisponível — download de kit ZIP desativado.'); }
+// N3.js VENDORADO (UMD → window.N3), como nas outras páginas: o import de
+// esm.sh era a cadeia mais longa do boot (13 hops — ~1 s em rede boa, vários
+// segundos no celular) e caía em silêncio com ETP/offline. Carregado sob
+// demanda pelo loadCatalog, uma vez só.
+let _n3P = null;
+function n3Parser() {
+  return _n3P ||= (window.N3 ? Promise.resolve() : _loadScript('./lib/n3.min.js'))
+    .then(() => window.N3.Parser);
+}
+// (JSZip saiu daqui: nada nesta página o usava — o kit ZIP vive no app.js.)
 
 // heic2any: HEIC → JPEG no cliente. Chrome/Firefox não decodificam HEIC
 // nativamente; sem isto, `createImageBitmap` falha em arquivos de iPhone.
-let heic2any = null;
-try {
-  heic2any = (await import('https://esm.sh/heic2any@0.0.4')).default;
-} catch (_) { console.warn('heic2any indisponível — uploads HEIC só funcionarão no Safari.'); }
+// Import NÃO-bloqueante e memoizado por promise: o boot não espera 1,35 MB
+// (340 KB gz) que só o primeiro HEIC fora do Safari usa; quem precisar
+// aguarda a promise (N cards concorrentes não disparam N imports). Prefetch
+// eager só onde o fallback existe de fato — o Safari decodifica HEIC
+// nativamente e nunca chega nele.
+let heic2any = null, _heicP = null;
+function heic2anyReady() {
+  return _heicP ||= import('https://esm.sh/heic2any@0.0.4')
+    .then(m => { heic2any = m.default; return heic2any; })
+    .catch(() => { console.warn('heic2any indisponível — uploads HEIC só funcionarão no Safari.'); return null; });
+}
+if (!/^((?!chrome|android).)*safari/i.test(navigator.userAgent)) heic2anyReady();
 
 // ===================== Helpers básicos =================================
 function turtle_escape(s) {
@@ -427,8 +453,15 @@ function dateToLocalInput(d) {
 // SP) não muda.
 function localToXsdDateTime(s, offsetOverride) {
   const d = new Date(s); if (isNaN(d)) return null;
-  const m = /^([+-])(\d{2}):?(\d{2})$/.exec(offsetOverride || '');
+  let m = /^([+-])(\d{2}):?(\d{2})$/.exec(offsetOverride || '');
   let sign, oh, om;
+  // Um OffsetTimeOriginal corrompido (ex.: "+45:00") passaria no regex e
+  // assaria um xsd:dateTime inválido no catálogo — o XSD limita o fuso a
+  // ±14:00. Fora da faixa, ignora o override e cai no fuso do navegador.
+  if (m && (parseInt(m[2], 10) > 14 || parseInt(m[3], 10) > 59)) {
+    console.warn(`EXIF OffsetTimeOriginal inválido (${offsetOverride}) — usando fuso do navegador`);
+    m = null;
+  }
   if (m) {
     [, sign, oh, om] = m;
   } else {
@@ -718,7 +751,7 @@ function fmtAssoc(label, n) {
 async function loadCatalog() {
   let Parser;
   try {
-    ({ Parser } = await import('https://esm.sh/n3@1.17.4?bundle'));
+    Parser = await n3Parser();
   } catch (e) {
     throw new Error('N3.js indisponível.');
   }
@@ -731,10 +764,16 @@ async function loadCatalog() {
   const existingPhashes = new Set();
   const existingVhashes = new Set();
   // tours.ttl tem os passeios; images.ttl tem as mídias (e seus hashes via IRI).
-  for (const url of ['./data/tours.ttl', './data/images.ttl', './data/identities.ttl', './data/lists.ttl']) {
+  // Os 4 dumps em PARALELO (eram 4 round trips em série, cada um um request no
+  // Cloud Run); o parse segue na ordem da lista.
+  const CATALOG_URLS = ['./data/tours.ttl', './data/images.ttl', './data/identities.ttl', './data/lists.ttl'];
+  const texts = await Promise.all(CATALOG_URLS.map(url =>
+    fetch(url).then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.text(); })
+      .catch(e => { console.warn(`Catálogo: ${url} indisponível —`, e.message); return null; })));
+  for (const [i, text] of texts.entries()) {
+    const url = CATALOG_URLS[i];
+    if (text == null) continue;
     try {
-      const res = await fetch(url); if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const text = await res.text();
       for (const q of new Parser().parse(text)) {
         const s = q.subject.value, p = q.predicate.value, o = q.object.value;
         if (p === RDF_TYPE) { if (!types.has(s)) types.set(s, new Set()); types.get(s).add(o); }
@@ -1022,7 +1061,7 @@ async function extractMediaFields(iri) {
   // IRI de mídia é opaco (med:<hash>); o hash é o localname, e o TIPO
   // (foto/vídeo) vem da CLASSE no catálogo (detectado no loop abaixo).
   const hash = iri.startsWith(MED_NS) ? iri.slice(MED_NS.length) : iri.split('/').pop();
-  let Parser; ({ Parser } = await import('https://esm.sh/n3@1.17.4?bundle'));
+  const Parser = await n3Parser();
   const res = await fetch('./data/images.ttl', { cache: 'no-cache' });
   if (!res.ok) throw new Error('uploads.ttl indisponível (' + res.status + ')');
   const text = await res.text();
@@ -1211,6 +1250,7 @@ async function saveMediaEdit(f, card, authorTs, providerTs, listTs, orig) {
     try { const j = await res.json(); msg = (j.details && j.details.join('; ')) || j.error || msg; } catch (e) {}
     throw new Error(msg);
   }
+  notifyParentChanged('update-' + f.kind, f.hash);
   return res.json();
 }
 
@@ -1915,6 +1955,113 @@ async function transcodeAtShortSide(blob, startSec, endSec, shortSide, onProgres
   });
 }
 
+// Um único passe de reprodução alimenta os TRÊS encoders (áudio-only, 720p,
+// 360p). O MediaRecorder grava em TEMPO REAL, então os três passes em série
+// (extractAudio + 2× transcodeAtShortSide) custavam 3× a duração do recorte
+// só de espera depois do "Enviar" — um clipe de 40 s eram 2 min. Aqui: um
+// <video>, um grafo de áudio, dois canvases desenhados no MESMO rAF, três
+// recorders (a trilha de áudio clonada pra cada um). Se o browser recusar
+// três recorders simultâneos, o chamador cai pro caminho sequencial antigo
+// (as funções abaixo continuam existindo por isso).
+async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 = true, onProgress } = {}) {
+  return new Promise(async (resolve, reject) => {
+    const video = document.createElement('video');
+    const url = URL.createObjectURL(blob);
+    video.src = url;
+    video.muted = false;
+    video.playsInline = true;
+    video.preload = 'auto';
+    let audioCtx = null, audioSrc = null;
+    const streams = [], recorders = [];
+    let raf = 0, watchdog = 0, settled = false;
+    const cleanup = () => {
+      cancelAnimationFrame(raf);
+      clearTimeout(watchdog);
+      for (const s of streams) { try { s.getTracks().forEach(t => t.stop()); } catch (_) {} }
+      try { audioSrc?.disconnect(); } catch (_) {}
+      try { audioCtx?.close(); } catch (_) {}
+      try { video.pause(); } catch (_) {}
+      URL.revokeObjectURL(url);
+    };
+    const done = (out) => { if (settled) return; settled = true; cleanup(); resolve(out); };
+    const fail = (err) => { if (settled) return; settled = true; cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
+    try {
+      await waitVideoEvent(video, 'loadedmetadata', 'vídeo não carregou');
+      const iw = video.videoWidth, ih = video.videoHeight;
+      if ((want720 || want360) && (!iw || !ih)) throw new Error('vídeo sem dimensões');
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      audioSrc = audioCtx.createMediaElementSource(video);
+      const audioDest = audioCtx.createMediaStreamDestination();
+      audioSrc.connect(audioDest);
+      streams.push(audioDest.stream);
+      const audioTrack = audioDest.stream.getAudioTracks()[0];
+      const vmime = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+        ? 'video/webm;codecs=vp9,opus'
+        : (MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus') ? 'video/webm;codecs=vp8,opus' : 'video/webm');
+      const amime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm';
+      const outs = {};   // key → { rec, chunks, type }
+      const mk = (key, stream, opts, type) => {
+        const rec = new MediaRecorder(stream, opts);
+        const chunks = [];
+        rec.ondataavailable = (e) => { if (e.data?.size) chunks.push(e.data); };
+        rec.onerror = (e) => fail(e.error || new Error(`recorder ${key} error`));
+        outs[key] = { rec, chunks, type };
+        recorders.push(rec);
+      };
+      mk('audio', audioDest.stream, { mimeType: amime, audioBitsPerSecond: 192_000 }, 'audio/webm');
+      const draws = [];
+      const aspect = iw / ih;
+      for (const [key, shortSide, vbr, want] of [['blob720', 720, 1_600_000, want720], ['blob360', 360, 700_000, want360]]) {
+        if (!want) continue;
+        let outW, outH;
+        if (iw >= ih) { outH = shortSide; outW = Math.round(shortSide * aspect); }
+        else          { outW = shortSide; outH = Math.round(shortSide / aspect); }
+        outW -= outW % 2; outH -= outH % 2;
+        const canvas = document.createElement('canvas');
+        canvas.width = outW; canvas.height = outH;
+        const ctx = canvas.getContext('2d');
+        const vs = canvas.captureStream(30);
+        streams.push(vs);
+        let atrack = audioTrack;
+        try { atrack = audioTrack.clone(); } catch (_) { /* sem clone: compartilha a trilha */ }
+        const combined = new MediaStream([...vs.getVideoTracks(), atrack]);
+        streams.push(combined);
+        mk(key, combined, { mimeType: vmime, videoBitsPerSecond: vbr, audioBitsPerSecond: 128_000 }, 'video/webm');
+        draws.push(() => ctx.drawImage(video, 0, 0, outW, outH));
+      }
+      let pending = recorders.length;
+      const results = {};
+      for (const [key, o] of Object.entries(outs)) {
+        o.rec.onstop = () => {
+          results[key] = new Blob(o.chunks, { type: o.type });
+          if (--pending === 0) done(results);
+        };
+      }
+      video.currentTime = startSec;
+      await waitVideoEvent(video, 'seeked', 'seek falhou');
+      let stopped = false;
+      const dur = Math.max(0.001, endSec - startSec);
+      for (const r of recorders) r.start(250);
+      watchdog = setTimeout(() => fail(new Error('transcode timeout')), dur * 1000 + 8000);
+      video.play().catch((e) => fail(new Error('play() rejeitado: ' + (e?.message || e))));
+      const render = () => {
+        if (stopped || settled) return;
+        if (video.currentTime >= endSec || video.ended) {
+          stopped = true;
+          for (const r of recorders) { try { r.stop(); } catch (_) {} }
+          return;
+        }
+        for (const d of draws) d();
+        if (onProgress) onProgress(Math.min(1, (video.currentTime - startSec) / dur));
+        raf = requestAnimationFrame(render);
+      };
+      raf = requestAnimationFrame(render);
+    } catch (e) {
+      fail(e);
+    }
+  });
+}
+
 // Extrai o áudio do trecho [startSec, endSec] como opus dentro de webm
 // — 192 kbps é perceptualmente transparente pra material falado/ambiente
 // e mantém arquivos pequenos. Sem WAV: arquivos seriam ~5 MB por 30 s,
@@ -2041,6 +2188,7 @@ async function preprocessImageFile(file) {
     if (!isHeicFile(file)) {
       return fail('decode-error', `<strong>${escapeHtml(file.name)}</strong>: não consegui ler (${escapeHtml(nativeErr.message)}).`);
     }
+    if (!heic2any) await heic2anyReady();
     if (!heic2any) {
       return fail('heic-unavailable', `<strong>${escapeHtml(file.name)}</strong>: HEIC requer heic2any (CDN indisponível).`);
     }
@@ -2449,13 +2597,21 @@ async function withWakeLock(fn) {
 }
 
 // ===================== File pickers ====================================
-// Picker único: cada seleção APPENDA aos cards existentes
-$('#files').addEventListener('change', async (e) => {
-  if (pickerBusy) return;            // evita re-entrada (alguns browsers disparam change 2×)
+// Picker único: cada seleção APPENDA aos cards existentes. O <input> é lido e
+// zerado na hora; o processamento roda em handlePickedFiles. Uma seleção feita
+// enquanto um lote ainda processa entra na FILA (antes o guard de re-entrada
+// a descartava em silêncio), e as feitas durante o boot (listener provisório
+// no topo do módulo) chegam aqui assim que ele termina.
+const _pickQueue = [];
+$('#files').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';             // permite re-selecionar os mesmos arquivos depois
+  if (files.length) handlePickedFiles(files);
+});
+async function handlePickedFiles(files) {
+  if (pickerBusy) { _pickQueue.push(files); return; }   // enfileira, não descarta
   pickerBusy = true;
   try {
-    const files = [...e.target.files];
-    if (!files.length) return;
     clearNotices();                  // mensagens antigas saem antes do novo lote
     const defaults = readDefaults();
     const tally = { ok: 0, duplicate: 0, 'decode-error': 0, 'vhash-failed': 0,
@@ -2489,12 +2645,19 @@ $('#files').addEventListener('change', async (e) => {
     if (errs)                        parts.push(`<span class="err">${errs} com erro</span>`);
     parts.push(`(total: ${cards.length}).`);
     $('#filesStatus').innerHTML = parts.join(' · ');
-    e.target.value = '';             // permite re-selecionar os mesmos arquivos depois
     refreshGenerateButtons();
   } finally {
     pickerBusy = false;
+    const next = _pickQueue.shift();
+    if (next) handlePickedFiles(next);
   }
-});
+}
+// Seleções feitas ANTES do boot terminar (listener provisório no topo).
+{
+  const early = (window._phidroEarlyPicks || []).splice(0);
+  window._phidroEarlyPicks = null;   // desliga o provisório
+  for (const files of early) handlePickedFiles(files);
+}
 
 function clearAllCards() {
   for (const c of [...cards]) removeCard(c);   // remove cada card + sua miniatura
@@ -2843,6 +3006,7 @@ async function uploadImageCard(card) {
     }
     card.uploaded = true;
     setCardStatus(card, `✓ enviada (phash ${data.phash || card.phash})`, 'ok');
+    notifyParentChanged('upload-image', data.phash || card.phash);
     return true;
   } catch (e) {
     setCardStatus(card, `erro de rede: ${e.message}`, 'err');
@@ -2899,13 +3063,33 @@ async function uploadVideoCard(card) {
     } else {
       setCardStatus(card, 'extraindo thumbnail…', 'warn');
       thumbBlob = await videoFirstFrameBlob(card.file).catch(() => null);
-      setCardStatus(card, 'extraindo áudio (opus 192k)…', 'warn');
-      audioBlob = await extractAudio(card.file, tStart, tEnd);
-      if (!audioOnly) {
-        setCardStatus(card, 'transcodando 720p…', 'warn');
-        blob720 = await transcodeAtShortSide(card.file, tStart, tEnd, 720);
-        setCardStatus(card, 'transcodando 360p…', 'warn');
-        blob360 = await transcodeAtShortSide(card.file, tStart, tEnd, 360);
+      // Passe único (áudio + 720p + 360p de uma vez, ~1× a duração do
+      // recorte) com progresso; fallback pro sequencial antigo (3 passes) se o
+      // browser recusar três recorders simultâneos.
+      const label = audioOnly ? 'extraindo áudio (opus 192k)' : 'transcodando áudio + 720p + 360p (passe único)';
+      let lastPct = -1;
+      const progress = (tag) => (p) => {
+        const pct = Math.round(p * 100);
+        if (pct !== lastPct) { lastPct = pct; setCardStatus(card, `${tag}… ${pct}%`, 'warn'); }
+      };
+      setCardStatus(card, `${label}…`, 'warn');
+      try {
+        const out = await transcodeClip(card.file, tStart, tEnd,
+          { want720: !audioOnly, want360: !audioOnly, onProgress: progress(label) });
+        audioBlob = out.audio;
+        blob720 = out.blob720 || null;
+        blob360 = out.blob360 || null;
+      } catch (e) {
+        console.warn('transcode em passe único falhou — caindo pro sequencial:', e.message);
+        lastPct = -1;
+        setCardStatus(card, 'extraindo áudio (opus 192k)…', 'warn');
+        audioBlob = await extractAudio(card.file, tStart, tEnd, progress('extraindo áudio'));
+        if (!audioOnly) {
+          lastPct = -1;
+          blob720 = await transcodeAtShortSide(card.file, tStart, tEnd, 720, progress('transcodando 720p'));
+          lastPct = -1;
+          blob360 = await transcodeAtShortSide(card.file, tStart, tEnd, 360, progress('transcodando 360p'));
+        }
       }
       card.processed = { tStart, tEnd, audioOnly, thumb: thumbBlob, audio: audioBlob, blob360, blob720 };
     }
@@ -2935,6 +3119,7 @@ async function uploadVideoCard(card) {
     }
     card.uploaded = true;
     setCardStatus(card, `✓ enviado (video_${card.clipId})`, 'ok');
+    notifyParentChanged('upload-video', card.clipId);
     return true;
   } catch (e) {
     setCardStatus(card, `erro de rede: ${e.message}`, 'err');
@@ -2945,6 +3130,17 @@ async function uploadVideoCard(card) {
 
 function setUploadAllStatus(html) {
   $$('.upload-all-status').forEach((el) => { el.innerHTML = html; });
+}
+
+// Avisa o app-pai (iframe modal) que o catálogo mudou. Ele marca o modal como
+// "sujo" e só recarrega o mapa ao fechar se algo foi salvo — antes recarregava
+// os 4 dumps + refazia todos os marcadores em TODO fechamento, mesmo sem envio.
+function notifyParentChanged(kind, hash) {
+  try {
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: 'phidro-media-changed', kind, hash }, window.location.origin);
+    }
+  } catch (_) {}
 }
 
 // Concorrência do "Enviar todas": até UPLOAD_CONCURRENCY cards em voo. O ganho

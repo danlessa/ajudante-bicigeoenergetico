@@ -986,6 +986,28 @@ pas:bkbpnjf2 a ph:Tour ;
     schema:identifier "conhecer-cachoeira-do-corrego-augusta-e-cantar-rios-no" ;
     schema:image <https://storage.googleapis.com/phidro-state/tour_assets/ph97/announcement.jpg> .
 
+pas:bp49gw62 a ph:Tour ;
+    dcterms:date "2026-08-22T08:00:00-03:00"^^xsd:dateTime ;
+    dcterms:description """Hidroviagem para celebrar as águas que vibram em nossa amiga Amanda! Sai 8h da Estação Estudantes (Mogi) - ou seja, programe-se pra sair às 6h30 da Luz ou Barra Funda. Chegamos lá por volta das 15h, batemos um marmitex pra curtir a praia onde deságua o rio Itaguaré e dormir cedo pra, no dia seguinte, seguirmos a Trilha D’Água em um roteiro literário com a @kaaete.eco. De lá, rangão e botar bike no bus pra voltar pra SP.\r
+\r
+🚨Recomendado pra quem já faz suave pedal 30 km+\r
+\r
+🚨 Leve sua bike revisada (freio!!), capacete, câmara reserva e tranca\r
+\r
+🚨 Vá de short de bundinha (bretelle)\r
+\r
+🚨 Bagageiro e mochilas acopladas na bike e não nas costas\r
+\r
+🚨 Levar jumbo-laricas pros dois dias"""@pt ;
+    dcterms:title "Hidroviagem! Bertioga" ;
+    prov:wasAttributedTo pes:wgb9b5fe ;
+    ph:countAttendee 16 ;
+    ph:energyEstimate 855.0 ;
+    ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/Hidroviagem/1> ;
+    ph:linkRoute pas:bp49gw62_route ;
+    schema:identifier "hidroviagem-bertioga" ;
+    schema:image <https://storage.googleapis.com/phidro-state/tour_assets/bp49gw62/announcement.jpg> .
+
 pas:bs81z5bx a ph:Tour ;
     dcterms:date "2026-02-12T00:00:00-03:00"^^xsd:dateTime ;
     dcterms:title "As águas da desilusão e Urutau Modernista" ;
@@ -1649,10 +1671,10 @@ As curvas do Tietê nos levam para as origens operárias da expansão da cidade,
 
 pas:pbdgaaab a ph:Tour ;
     dcterms:date "2025-06-03T20:00:00-03:00"^^xsd:dateTime ;
-    dcterms:description """Por adrn_alef ✍️ Dentre as inúmeras paisagens que compõem a cidade-colagem conhecida como São Paulo, os territórios que rodeiam o córrego da Água Espraiada se mostram como um espaço privilegiado para observar e compreender as tensões, as cisões e as especulações que ocorrem na cidade em suas mais diversas formas.
-
-Começamos pela foz do rio, na altura da famosa Ponte Estaiada, ícone rodoviarista tratado pela mídia hegemônica como cartão-postal da cidade (embora não haja notícias de alguém que tenha vindo à cidade para conhecê-la). Seguimos pela atual Avenida Roberto Marinho (inicialmente nomeada como Avenida Água Espraiada). Vista hoje como uma área "nobre", trata-se de uma ferida aberta em meio ao tecido sangrante da urbe, concebida para desalojar uma série de favelas que existiam na região até as décadas de 90 e 2000, uma delas, a do Canão, imortalizada nas letras do grande rapper Sabotage.
-
+    dcterms:description """Por adrn_alef ✍️ Dentre as inúmeras paisagens que compõem a cidade-colagem conhecida como São Paulo, os territórios que rodeiam o córrego da Água Espraiada se mostram como um espaço privilegiado para observar e compreender as tensões, as cisões e as especulações que ocorrem na cidade em suas mais diversas formas.\r
+\r
+Começamos pela foz do rio, na altura da famosa Ponte Estaiada, ícone rodoviarista tratado pela mídia hegemônica como cartão-postal da cidade (embora não haja notícias de alguém que tenha vindo à cidade para conhecê-la). Seguimos pela atual Avenida Roberto Marinho (inicialmente nomeada como Avenida Água Espraiada). Vista hoje como uma área "nobre", trata-se de uma ferida aberta em meio ao tecido sangrante da urbe, concebida para desalojar uma série de favelas que existiam na região até as décadas de 90 e 2000, uma delas, a do Canão, imortalizada nas letras do grande rapper Sabotage.\r
+\r
 Após o fim da Av. Roberto Marinho, a paisagem se altera: saem de cena os prédios de luxo e de classe média, e chega a quebrada, mostrando que mesmo com os apagamentos, as letras de Sabota ainda se mostram presentes. Passando por várias favelas, como a do Vietnã, o curso d'água segue um traçado mais próximo ao de um córrego antes de uma canalização; até que chegamos em sua nascente, nas proximidades do pátio da estação Jabaquara da Linha 1 Azul do metrô."""@pt ;
     dcterms:title "Água Espraiada da Foz à Nascente" ;
     prov:wasAttributedTo pes:1fhkjnba,
@@ -1662,11 +1684,12 @@ Após o fim da Av. Roberto Marinho, a paisagem se altera: saem de cena os prédi
     ph:countNewcomer 3 ;
     ph:departedAt "2025-06-03T20:26:00-03:00"^^xsd:dateTime ;
     ph:energyEstimate 280.0 ;
+    ph:hadIncident "1x câmara furada"@pt ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/39> ;
     ph:linkActivity "https://www.strava.com/activities/14689988215"^^xsd:anyURI ;
     ph:linkInstagram "https://www.instagram.com/p/DKag2XjuRJd/"^^xsd:anyURI ;
     ph:linkRoute pas:pbdgaaab_route ;
-    ph:measuredEnergy 250.2 ;
+    ph:measuredEnergy 250.0 ;
     ph:mediaCount 125 ;
     ph:mediaSweep pas:pbdgaaab_sweep ;
     ph:movingDuration "PT1H32M"^^xsd:duration ;
@@ -2397,12 +2420,26 @@ Partindo das colinas do Tatuapé, mergulhamos em Aricanduva com vistas de passar
 \r
 Voltamos para a margem esquerda do Tietê com vistas a pegar o trem na CPTM Itaim, com o translado feito pela Jardim Helena / Pantanal."""@pt ;
     dcterms:title "Médio Tietê acima" ;
+    ph:arrivalLocation "CPTM Itaim Paulista" ;
+    ph:arrivedAt "2026-08-18T23:31:00-03:00"^^xsd:dateTime ;
     ph:countAttendee 17 ;
     ph:countNewcomer 4 ;
+    ph:departedAt "2026-08-18T20:30:00-03:00"^^xsd:dateTime ;
+    ph:departureLocation "Bar do Wilson - Metrô Tatuapé" ;
     ph:energyEstimate 331.0 ;
+    ph:hadBonde true ;
+    ph:hadIncident "1x câmara furada"@pt ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/107> ;
+    ph:linkActivity "https://ridewithgps.com/trips/406410571"^^xsd:anyURI,
+        "https://www.strava.com/activities/19803166194"^^xsd:anyURI,
+        "https://www.strava.com/activities/19803173396"^^xsd:anyURI,
+        "https://www.strava.com/activities/19803186994"^^xsd:anyURI,
+        "https://www.strava.com/activities/19803537521"^^xsd:anyURI,
+        "https://www.strava.com/activities/19803662424"^^xsd:anyURI ;
     ph:linkInstagram "https://www.instagram.com/p/DcHvFcNlN3l/"^^xsd:anyURI ;
     ph:linkRoute pas:x8mkn0ys_route ;
+    ph:measuredEnergy 283.0 ;
+    ph:movingDuration "PT2H"^^xsd:duration ;
     schema:identifier "medio-tiete-acima" ;
     schema:image <https://storage.googleapis.com/phidro-state/tour_assets/x8mkn0ys/announcement.png> .
 
@@ -2493,7 +2530,8 @@ pas:y3zptkf2 a ph:Tour ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/109> ;
     ph:linkInstagram "https://www.instagram.com/p/DcvvofwIDay/"^^xsd:anyURI ;
     ph:linkRoute pas:y3zptkf2_route ;
-    schema:identifier "reedicao-ruinas" .
+    schema:identifier "reedicao-ruinas" ;
+    schema:image <https://storage.googleapis.com/phidro-state/tour_assets/y3zptkf2/announcement.jpg> .
 
 pas:yaszq6sb a ph:Tour ;
     dcterms:date "2025-07-01T20:00:00-03:00"^^xsd:dateTime ;
@@ -3088,6 +3126,10 @@ pas:9s8bhtjw_route a ph:RouteReference ;
     ph:inEventSeries ser:BT ;
     ph:sequenceInSeries 3 .
 
+<https://id.pedalhidrografi.co/passeio/Hidroviagem/1> a ph:SeriesEdition ;
+    ph:inEventSeries ser:Hidroviagem ;
+    ph:sequenceInSeries 1 .
+
 <https://id.pedalhidrografi.co/passeio/PH/1> a ph:SeriesEdition ;
     ph:inEventSeries ser:PH ;
     ph:sequenceInSeries 1 .
@@ -3631,6 +3673,10 @@ pas:b4rs49rh_sweep a ph:MediaSweep ;
 pas:bkbpnjf2_route a ph:RouteReference ;
     schema:provider ph:rwgps ;
     schema:url <https://ridewithgps.com/routes/55785987> .
+
+pas:bp49gw62_route a ph:RouteReference ;
+    schema:provider ph:rwgps ;
+    schema:url <https://ridewithgps.com/routes/56533220> .
 
 pas:bs81z5bx_route a ph:RouteReference ;
     schema:provider ph:rwgps ;
@@ -4573,6 +4619,9 @@ pas:zv43bb5y_sweep a ph:MediaSweep ;
         "giucuci",
         "rosselinetavares",
         "tiagoruf" .
+
+ser:Hidroviagem a schema:EventSeries ;
+    dcterms:title "Hidroviagem" .
 
 ser:SESC a schema:EventSeries ;
     dcterms:title "SESC" .

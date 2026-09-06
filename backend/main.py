@@ -60,6 +60,7 @@ import functools
 import json
 import math
 import os
+import traceback
 import re
 import threading
 import time
@@ -97,6 +98,13 @@ ONTOLOGY_PATH = DATA_DIR / "ontology.ttl"
 # store não expõe URL pública (modo local): é o que impede um backend de dev
 # de assar `http://localhost:8080/…` numa IRI do catálogo.
 PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
+
+# Content-Signal (contentsignals.org) que acompanha as respostas Markdown pra
+# agentes — o mesmo default do "Markdown for Agents" da Cloudflare. É sinal de
+# política, não bloqueio: declara como o acervo (dados abertos, mídia CC BY-SA)
+# pode ser usado. String vazia desliga o header.
+CONTENT_SIGNAL = os.environ.get(
+    "CONTENT_SIGNAL", "ai-train=yes, search=yes, ai-input=yes").strip()
 
 # Store = estado mutável. Em modo local, raiz = PHIDRO_WEB (layout:
 # data/uploads.ttl, photos/<phash>/...); em modo gcs, raiz é o
@@ -194,6 +202,7 @@ app.config["COMPRESS_MIMETYPES"] = [
     "application/json", "text/turtle", "image/svg+xml",
     "application/manifest+json", "application/gpx+xml",
     "application/rss+xml", "application/xml", "text/xml",
+    "text/markdown", "application/linkset+json",
 ]
 # send_from_directory devolve resposta *streamed* (file wrapper) e o
 # flask-compress pula essas por padrão — sem isto app.js/style.css sairiam
@@ -427,6 +436,24 @@ def _load_validator():
         return _validator
     import pyshacl
     from rdflib import Graph
+    # owlrl (a inferência rdfs do pyshacl) troca os conversores de datatype do
+    # rdflib GLOBALMENTE durante cada closure (use_Alt_lexical_conversions) e
+    # restaura no fim. Qualquer thread que estivesse parseando Turtle nesse
+    # intervalo via os xsd:dateTime passarem pelo conversor alternativo, que
+    # desloca o offset UTC uma hora (-03:00 → -04:00, …). Como cada gravação
+    # re-serializa o catálogo inteiro, o desvio se acumulava a cada upload
+    # (435 das 460 datas de mídia chegaram a -23:00; ver
+    # scripts/migrate-date-offsets.py). `improved_datatype_generic = True` faz
+    # o owlrl acreditar que os conversores já estão instalados e pular a troca
+    # (owlrl/__init__.py, DeductiveClosure.expand); a segunda linha garante os
+    # do rdflib caso algum closure anterior tenha trocado.
+    try:
+        import owlrl
+        from owlrl import DatatypeHandling
+        owlrl.DeductiveClosure.improved_datatype_generic = True
+        DatatypeHandling.use_RDFLib_lexical_conversions()
+    except Exception as e:  # noqa: BLE001
+        print(f"[shacl] aviso: não consegui travar os conversores do owlrl: {e}")
     # Lê via _load_dump_text — bucket-first (permite override sem redeploy),
     # com fallback pro arquivo baked-in no container. Mesma semântica que
     # o catálogo: bucket é a fonte vigente, container é o seed inicial.
@@ -449,35 +476,137 @@ def _load_validator():
     return _validator
 
 
-# Mundo (TTLs listadas no manifesto), construído sob demanda e invalidado
-# após cada upload/delete. O validador o mescla com o TTL recebido para
-# que `sh:class ph:Tour` etc. enxerguem o universo todo (passeios,
-# pessoas, uploads anteriores).
-_catalog_cache = None
-_catalog_types_cache = None
+# ── Catálogo residente em memória ───────────────────────────────────────
+# Cada dump (tours/images/identities/lists + shapes/ontology) fica em memória
+# como TEXTO (o que /data/<ttl> serve, com ETag) e, pros catálogos, como GRAFO
+# rdflib VIVO — parseado UMA vez por processo e mutado in place pelos RMW
+# (upsert/purge) sob _state_lock, em vez de re-ler do store + re-parsear
+# ~430 KB a cada gravação (era ~120-240 ms de parse por foto, ×6 leituras num
+# save de passeio — e em GCS cada leitura era um HEAD+GET).
+#
+# Regras:
+#  • o grafo VIVO (`_dump_graph`) só é tocado sob _state_lock — mutação E
+#    iteração (um add/remove concorrente a uma iteração estoura o store de
+#    memória do rdflib). Quem lê fora do lock usa o SNAPSHOT (`_load_catalog`),
+#    uma cópia imutável da união dos catálogos, refeita preguiçosamente depois
+#    de cada commit (~14k adds, dezenas de ms — nada de I/O nem parse).
+#  • `_mutating(fname)` é o jeito de mutar: entrega o grafo vivo sob o lock e,
+#    ao sair, `_commit_dump` serializa, grava no store, atualiza o texto em
+#    cache e invalida o snapshot. Se o corpo ou a gravação falhar, o grafo vivo
+#    é descartado (o próximo acesso re-parseia o texto anterior) — memória e
+#    store nunca divergem.
+#  • Escritas fora de banda no bucket (state-history restore, deploy --state,
+#    edição manual) continuam exigindo POST /reload, que zera tudo
+#    (`_reset_dump_caches`). É o protocolo que já valia pro catálogo.
+_dumps = {}                 # fname → {"text": str|None, "graph": Graph|None}
+_catalog_cache = None       # snapshot (união imutável dos CATALOG_DUMPS)
 
 
 def _invalidate_catalog():
-    global _catalog_cache, _catalog_types_cache
+    """Invalida SÓ o snapshot da união (barato de refazer a partir dos grafos
+    vivos). _commit_dump já chama; as chamadas explícitas dos handlers seguem
+    válidas (idempotente)."""
+    global _catalog_cache
     _catalog_cache = None
-    _catalog_types_cache = None
+
+
+def _reset_dump_caches():
+    """Descarta texto E grafos de todos os dumps — a próxima leitura volta ao
+    store. Pra depois de escritas fora de banda (POST /reload)."""
+    global _catalog_cache
+    with _state_lock:
+        _dumps.clear()
+        _catalog_cache = None
 
 
 def _load_dump_text(fname):
-    """Resolve um dump TTL — bucket primeiro, container como fallback.
+    """Texto de um dump TTL — bucket primeiro, container como fallback —
+    cacheado em memória até o próximo commit/reload.
 
     Bucket-first permite override de shapes/ontology/tours sem redeploy do
-    container: basta `gcloud storage cp` pro bucket. O container traz uma
-    cópia "seed" usada quando o bucket ainda não tem o arquivo (boot inicial,
-    rollback, dev local sem GCS).
+    container: basta `gcloud storage cp` pro bucket (+ POST /reload). O
+    container traz uma cópia "seed" usada quando o bucket ainda não tem o
+    arquivo (boot inicial, rollback, dev local sem GCS). Sem lock: o
+    setdefault é atômico e, na pior corrida, duas threads leem o store e uma
+    delas vence — nunca sobrescreve um grafo vivo já parseado.
     """
+    e = _dumps.get(fname)
+    if e is not None:
+        return e["text"]
     text = STORE.read_text(f"data/{fname}")
-    if text:
-        return text
-    static_path = DATA_DIR / fname
-    if static_path.exists() and static_path.stat().st_size > 0:
-        return static_path.read_text()
-    return None
+    if not text:
+        static_path = DATA_DIR / fname
+        if static_path.exists() and static_path.stat().st_size > 0:
+            text = static_path.read_text()
+        else:
+            text = None
+    return _dumps.setdefault(fname, {"text": text, "graph": None})["text"]
+
+
+def _dump_graph(fname):
+    """Grafo rdflib VIVO do dump `fname` (parseado uma vez por processo). SÓ
+    sob _state_lock (RLock — reentrante): é mutado in place pelos RMW.
+    Leitura fora do lock → `_load_catalog()` (snapshot)."""
+    with _state_lock:
+        text = _load_dump_text(fname)
+        e = _dumps[fname]
+        if e["graph"] is None:
+            g = _load_validator()["Graph"]()
+            if text:
+                g.parse(data=text, format="turtle")
+            e["graph"] = g
+        return e["graph"]
+
+
+def _discard_dump_graph(fname):
+    """Joga fora o grafo vivo (o texto em cache fica): o próximo acesso
+    re-parseia o último estado PERSISTIDO."""
+    with _state_lock:
+        e = _dumps.get(fname)
+        if e is not None:
+            e["graph"] = None
+        _invalidate_catalog()
+
+
+def _commit_dump(fname):
+    """Persiste o grafo vivo de `fname`: serializa, grava no store, atualiza o
+    texto em cache, invalida o snapshot. Sob _state_lock. Se a gravação
+    falhar, o grafo vivo é descartado e a exceção sobe pro handler (500)."""
+    with _state_lock:
+        e = _dumps[fname]
+        text = e["graph"].serialize(format="turtle")
+        try:
+            STORE.write_text(f"data/{fname}", text)
+        except Exception:
+            _discard_dump_graph(fname)
+            raise
+        e["text"] = text
+        _invalidate_catalog()
+
+
+class _mutating:
+    """`with _mutating("images.ttl") as g:` — grafo vivo pra mutação, sob
+    _state_lock; commita ao sair; descarta o grafo vivo se o corpo levantar.
+    Aninhável (RLock): _route_new_persons abre identities.ttl de dentro de um
+    bloco de images.ttl/tours.ttl."""
+    def __init__(self, fname):
+        self.fname = fname
+    def __enter__(self):
+        _state_lock.acquire()
+        try:
+            return _dump_graph(self.fname)
+        except BaseException:
+            _state_lock.release()
+            raise
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if exc_type is not None:
+                _discard_dump_graph(self.fname)
+            else:
+                _commit_dump(self.fname)
+        finally:
+            _state_lock.release()
+        return False
 
 
 # Dumps que compõem o universo de validação. Era descoberto seguindo os
@@ -489,45 +618,58 @@ CATALOG_DUMPS = ("tours.ttl", "images.ttl", "identities.ttl", "lists.ttl")
 
 
 def _load_catalog():
+    """SNAPSHOT imutável da união dos CATALOG_DUMPS — pra leitura fora do lock
+    (validadores, resolvers, checagens de existência). Refeito
+    preguiçosamente a partir dos grafos vivos depois de cada commit; NUNCA
+    mutar o objeto devolvido."""
     global _catalog_cache
-    if _catalog_cache is not None:
-        return _catalog_cache
+    snap = _catalog_cache
+    if snap is not None:
+        return snap
+    with _state_lock:
+        if _catalog_cache is not None:
+            return _catalog_cache
+        catalog = _load_validator()["Graph"]()
+        for fname in CATALOG_DUMPS:
+            catalog += _dump_graph(fname)
+        _catalog_cache = catalog
+        return catalog
+
+
+def _validation_universe(data, catalog, exclude, own_subjects, inverse_preds=()):
+    """Grafo que o pyshacl valida: o fragmento + a ontologia + SÓ a fatia do
+    catálogo que as shapes consultam sobre os nós que o fragmento referencia.
+
+    As shapes só olham pro catálogo em dois lugares: `sh:class` nos OBJETOS do
+    fragmento (autora → schema:Person, ph:capturedDuring → ph:Tour, edição →
+    ph:SeriesEdition, série → schema:EventSeries, lista → schema:Collection…),
+    que precisa das triples rdf:type desses objetos; e o `sh:inversePath
+    ph:inSeriesEdition` da SeriesEditionShape (cada edição é realizada por
+    EXATAMENTE um passeio), que precisa das arestas dos OUTROS passeios que
+    apontam pra mesma edição. Mesclar o catálogo inteiro (~14k triples) só pra
+    isso custava ~1,3-1,6 s de closure rdfs + SHACL por gravação — e, como o
+    pyshacl roda sob _validate_lock, serializava todos os uploads atrás disso.
+    Com o universo referenciado cai pra milissegundos, com os MESMOS
+    vereditos (violations e warnings) pros sujeitos do fragmento (paridade
+    checada sobre todos os passeios e mídias do catálogo).
+
+    `exclude` = o sujeito em curso + seus nós derivados (re-upload não pode
+    sobrepor triples antigas às novas); `inverse_preds` = predicados cujas
+    arestas de ENTRADA (do catálogo) nos nós do fragmento entram no universo."""
+    from rdflib import URIRef, RDF
     v = _load_validator()
-    catalog = v["Graph"]()
-    loaded = 0
-    for fname in CATALOG_DUMPS:
-        text = _load_dump_text(fname)
-        if not text:
-            continue
-        try:
-            catalog.parse(data=text, format="turtle")
-            loaded += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"[validator] não consegui parsear {fname}: {e}")
-    _catalog_cache = catalog
-    print(f"[validator] catálogo: {loaded} arquivo(s), {len(catalog)} triples")
-    return catalog
-
-
-def _load_catalog_types():
-    """Subconjunto do catálogo com SÓ as triples `rdf:type` — o suficiente pras
-    checagens `sh:class` das shapes (autor→schema:Person, lista→schema:Collection,
-    ph:capturedDuring→ph:Tour, …). Validar contra este subconjunto em vez do
-    catálogo inteiro encolhe o grafo de ~9500 p/ ~2100 triples (~25% menos tempo
-    de SHACL por upload) SEM mudar o veredito do sujeito em curso: as shapes só
-    consultam o catálogo por `sh:class`, e o único `sh:sparql` é escopado a
-    passeios/séries (focus nodes filtrados por `own_subjects`). Cacheado junto do
-    catálogo (invalidado no mesmo `_invalidate_catalog`)."""
-    global _catalog_types_cache
-    if _catalog_types_cache is not None:
-        return _catalog_types_cache
-    from rdflib import RDF
-    catalog = _load_catalog()
-    types = _load_validator()["Graph"]()
-    for triple in catalog.triples((None, RDF.type, None)):
-        types.add(triple)
-    _catalog_types_cache = types
-    return types
+    merged = data + v["ont"]
+    refs = {o for o in data.objects()
+            if isinstance(o, URIRef) and o not in exclude and o not in own_subjects}
+    for o in refs:
+        for t in catalog.triples((o, RDF.type, None)):
+            merged.add(t)
+    for p in inverse_preds:
+        for node in own_subjects | refs:
+            for s, _p, _o in catalog.triples((None, p, node)):
+                if s not in exclude:
+                    merged.add((s, _p, _o))
+    return merged
 
 
 def validate_image_ttl(ttl_text):
@@ -572,14 +714,11 @@ def validate_image_ttl(ttl_text):
     # SHACL flagra cardinalidade > 1 em `dcterms:date` etc.
     # Exclui o próprio sujeito + seus nós derivados (hash, locationCreated).
     exclude = {img_uri} | _derived_subjects(catalog, img_uri)
-    # Universo de validação: data + ontology + SÓ as triples rdf:type do catálogo
-    # (não o catálogo inteiro) — o bastante pras checagens sh:class das shapes.
-    # A colisão cross-type e o `exclude` acima seguem calculados sobre o catálogo
-    # COMPLETO (comportamento de dedup/re-upload inalterado). Ver _load_catalog_types.
-    merged = data + v["ont"]
-    for s, p, o in _load_catalog_types():
-        if s not in exclude:
-            merged.add((s, p, o))
+    # Universo de validação: fragmento + ontologia + tipos dos nós referenciados
+    # (ver _validation_universe). A colisão cross-type e o `exclude` seguem
+    # calculados sobre o catálogo COMPLETO (dedup/re-upload inalterados).
+    own_subjects = set(data.subjects())
+    merged = _validation_universe(data, catalog, exclude, own_subjects)
     with _validate_lock:   # pyshacl não é thread-safe (parser SPARQL) — ver _validate_lock
         conforms, results_graph, _txt = v["pyshacl"].validate(
             merged, shacl_graph=v["shapes"], inference="rdfs", advanced=True)
@@ -821,16 +960,145 @@ _RDF_MIMES = ("text/turtle", "application/x-turtle", "application/ld+json",
               "application/rdf+xml", "application/n-triples")
 
 
-def _wants_turtle(request):
-    """True quando o cliente prefere RDF/turtle a HTML. `?format=ttl|turtle`
-    força; senão negocia pelo Accept (curl/browser com */* ou text/html → HTML)."""
+# Markdown pra agentes ("Markdown for Agents" — Cloudflare / isitagentready):
+# Accept: text/markdown devolve a MESMA página em Markdown limpo, sem o chrome
+# do app (mapa, modais, formulários) — a terceira representação, ao lado do
+# HTML (default) e do Turtle. Nas páginas que se montam client-side o Markdown
+# é um resumo + ponteiros pros dados; nas SSR'adas (passeio, Memória, série,
+# vocabulário, pessoa, mídia, lista) é o conteúdo inteiro.
+_MD_MIMES = ("text/markdown", "text/x-markdown")
+
+
+def _negotiated_format(request):
+    """'ttl' | 'md' | 'html' — a representação que o cliente prefere.
+    `?format=` força (ttl|turtle|rdf, md|markdown, html|web); senão negocia
+    pelo Accept. HTML é o default: curl/browser com */* ou text/html caem
+    nele, e um Accept que lista html e markdown com a mesma qualidade também
+    (o primeiro da lista desempata). Só um pedido que PREFERE markdown ou
+    turtle (ex.: `Accept: text/markdown`) sai do HTML."""
     fmt = (request.args.get("format") or "").lower()
     if fmt in ("ttl", "turtle", "rdf"):
-        return True
+        return "ttl"
+    if fmt in ("md", "markdown"):
+        return "md"
     if fmt in ("html", "web"):
-        return False
-    best = request.accept_mimetypes.best_match(["text/html"] + list(_RDF_MIMES))
-    return best is not None and best != "text/html"
+        return "html"
+    best = request.accept_mimetypes.best_match(
+        ["text/html", *_RDF_MIMES, *_MD_MIMES])
+    if best in _RDF_MIMES:
+        return "ttl"
+    if best in _MD_MIMES:
+        return "md"
+    return "html"
+
+
+def _wants_turtle(request):
+    """True quando o cliente prefere RDF/turtle a HTML (ver _negotiated_format)."""
+    return _negotiated_format(request) == "ttl"
+
+
+def _wants_markdown(request):
+    """True quando o cliente prefere Markdown a HTML (ver _negotiated_format)."""
+    return _negotiated_format(request) == "md"
+
+
+def _negotiated(resp):
+    """Resposta GERADA que varia por Accept (HTML | Markdown | Turtle na mesma
+    URL): `Vary: Accept` pra caches guardarem uma variante por representação
+    (o `add` preserva o Accept-Encoding do flask-compress) + ETag/conditional.
+    NÃO usar nos estáticos que o service worker pré-cacheia (index.html,
+    pessoas.html, imagens.html): o Cache API compara os headers listados no
+    Vary entre o request guardado (addAll por string, SEM Accept) e o de
+    navegação (COM Accept) — com Vary: Accept o shell offline pararia de casar."""
+    resp.vary.add("Accept")
+    return _conditional(resp)
+
+
+def _estimate_tokens(text):
+    """Estimativa de tokens do corpo (~4 caracteres por token, a heurística
+    usual dos tokenizadores BPE) — informativa, como o x-markdown-tokens da
+    Cloudflare."""
+    return max(1, math.ceil(len(text) / 4))
+
+
+def _markdown_response(md):
+    """text/markdown + os headers da convenção "Markdown for Agents":
+    x-markdown-tokens (estimativa), Content-Signal (política de uso — ver
+    CONTENT_SIGNAL) e Vary: Accept. no-cache + ETag como as páginas SSR."""
+    resp = Response(md, mimetype="text/markdown",
+                    headers={"Cache-Control": "no-cache"})
+    resp.headers["x-markdown-tokens"] = str(_estimate_tokens(md))
+    if CONTENT_SIGNAL:
+        resp.headers["Content-Signal"] = CONTENT_SIGNAL
+    return _negotiated(resp)
+
+
+def _md_inline(s):
+    """Texto de uma linha pra heading/item de lista Markdown: colapsa quebras
+    e espaços (um dcterms:title com \n quebraria o heading)."""
+    return " ".join(str(s or "").split())
+
+
+# ── Descoberta pra agentes (RFC 8288 / RFC 9727 §3) ─────────────────────────
+# Link header nas páginas (HTML e Markdown) apontando pros recursos legíveis
+# por máquina: o catálogo de APIs (/.well-known/api-catalog, linkset RFC 9264),
+# a descrição OpenAPI (service-desc, web/openapi.json — mantido à mão), o guia
+# llms.txt (service-doc), o manifesto VoID dos dumps (describedby) e o feed
+# RSS (alternate). Referências relativas — resolvem contra a URL da resposta,
+# então valem em qualquer host self-hosted. É o equivalente na origem da
+# Transform Rule que a Cloudflare sugere.
+_DISCOVERY_LINK = ", ".join((
+    '</.well-known/api-catalog>; rel="api-catalog"',
+    '</openapi.json>; rel="service-desc"; type="application/json"',
+    '</llms.txt>; rel="service-doc"; type="text/plain"',
+    '</data/data_graphs.ttl>; rel="describedby"; type="text/turtle"',
+    '</feed.xml>; rel="alternate"; type="application/rss+xml"',
+))
+
+
+@app.after_request
+def _discovery_links(resp):
+    """Anexa o Link de descoberta a toda página 200 (HTML/Markdown) — inclusive
+    a home, que é onde a RFC 9727 manda o cliente olhar. `add`, não `set`:
+    preserva um Link que o handler já tenha posto."""
+    if (request.method == "GET" and resp.status_code == 200
+            and resp.mimetype in ("text/html", "text/markdown")):
+        resp.headers.add("Link", _DISCOVERY_LINK)
+    return resp
+
+
+@app.get("/.well-known/api-catalog")
+def api_catalog():
+    """Catálogo de APIs (RFC 9727): um linkset JSON (RFC 9264) com uma entrada
+    por "API" publicada aqui — a HTTP do amora (OpenAPI + llms.txt + /health)
+    e o Linked Data em id.pedalhidrografi.co (VoID + vocabulário). Hrefs
+    absolutos em SITE_URL, como o formato pede."""
+    catalog = {"linkset": [
+        {
+            "anchor": SITE_URL,
+            "service-desc": [{"href": f"{SITE_URL}openapi.json",
+                              "type": "application/json",
+                              "title": "OpenAPI 3.1 — API HTTP do amora (leitura)"}],
+            "service-doc": [{"href": f"{SITE_URL}llms.txt",
+                             "type": "text/plain",
+                             "title": "llms.txt — guia do site pra agentes"}],
+            "status": [{"href": f"{SITE_URL}health"}],
+        },
+        {
+            "anchor": "https://id.pedalhidrografi.co/",
+            "service-doc": [{"href": f"{SITE_URL}llms.txt",
+                             "type": "text/plain"}],
+            "describedby": [
+                {"href": f"{SITE_URL}data/data_graphs.ttl", "type": "text/turtle",
+                 "title": "Manifesto VoID — todos os dumps RDF"},
+                {"href": f"{SITE_URL}terms", "type": "text/turtle",
+                 "title": "Vocabulário ph: (ontology.ttl)"},
+            ],
+        },
+    ]}
+    body = json.dumps(catalog, ensure_ascii=False, indent=2)
+    return _conditional(Response(body, mimetype="application/linkset+json",
+                                 headers={"Cache-Control": "public, max-age=3600"}))
 
 
 def _resource_slice_ttl(subject_iri, *dump_keys):
@@ -842,11 +1110,10 @@ def _resource_slice_ttl(subject_iri, *dump_keys):
     v = _load_validator()
     Graph = v["Graph"]
     from rdflib import URIRef, BNode
-    cat = Graph()
-    for k in dump_keys:
-        text = _load_dump_text(k)
-        if text:
-            cat.parse(data=text, format="turtle")
+    # Snapshot da união em memória (os dump_keys são sempre CATALOG_DUMPS e a
+    # fatia é por sujeito, então a união dá o mesmo resultado — sem re-parsear
+    # dumps por request).
+    cat = _load_catalog()
     subj = URIRef(subject_iri)
     roots = {subj} | _derived_subjects(cat, subj)
     out = Graph()
@@ -888,16 +1155,12 @@ def _route_new_persons(graph):
         persons |= set(graph.subjects(RDFT, c))
     if not persons:
         return
-    idg = _load_validator()["Graph"]()
-    existing = _load_dump_text("identities.ttl")
-    if existing:
-        idg.parse(data=existing, format="turtle")
-    for p in persons:
-        _purge_subject(idg, p)   # upsert: limpa def anterior (pessoas não têm derivados)
-        for t in list(graph.triples((p, None, None))):
-            idg.add(t)
-            graph.remove(t)
-    STORE.write_text(KEY_IDENTITIES, idg.serialize(format="turtle"))
+    with _mutating("identities.ttl") as idg:
+        for p in persons:
+            _purge_subject(idg, p)   # upsert: limpa def anterior (pessoas não têm derivados)
+            for t in list(graph.triples((p, None, None))):
+                idg.add(t)
+                graph.remove(t)
 
 
 def _route_new_collections(graph):
@@ -917,16 +1180,12 @@ def _route_new_collections(graph):
         colls |= set(graph.subjects(RDFT, c))
     if not colls:
         return
-    lg = _load_validator()["Graph"]()
-    existing = _load_dump_text("lists.ttl")
-    if existing:
-        lg.parse(data=existing, format="turtle")
-    for li in colls:
-        _purge_subject(lg, li)   # upsert: substitui def anterior (listas não têm derivados)
-        for t in list(graph.triples((li, None, None))):
-            lg.add(t)
-            graph.remove(t)
-    STORE.write_text(KEY_LISTS, lg.serialize(format="turtle"))
+    with _mutating("lists.ttl") as lg:
+        for li in colls:
+            _purge_subject(lg, li)   # upsert: substitui def anterior (listas não têm derivados)
+            for t in list(graph.triples((li, None, None))):
+                lg.add(t)
+                graph.remove(t)
 
 
 PROV_GEN_URI = "http://www.w3.org/ns/prov#generated"
@@ -939,38 +1198,31 @@ def upsert_image_in_uploads(image_ttl, phash, audit_ttl):
     Graph = v["Graph"]
     from rdflib import URIRef
     image_iri = URIRef(MED_NS + phash)
-    catalog = Graph()
-    existing = STORE.read_text(KEY_IMAGES)
-    if existing:
-        catalog.parse(data=existing, format="turtle")
-    # 1) Tira da imagem (+ bnodes de hash/loc).
-    _purge_subject(catalog, image_iri)
-    # 2) Tira qualquer ph:Upload activity que tenha gerado essa imagem.
-    for s in list(catalog.subjects(URIRef(PROV_GEN_URI), image_iri)):
-        _purge_subject(catalog, s)
-    # 3) Mescla os novos blocos (imagem + nova activity).
-    catalog += Graph().parse(data=image_ttl + audit_ttl, format="turtle")
-    # 4) Desvia pessoas novas (autora criada on-the-fly) pra identities.ttl
-    #    e listas novas inline pra lists.ttl.
-    _route_new_persons(catalog)
-    _route_new_collections(catalog)
-    STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
+    # Parse do fragmento ANTES de tocar o grafo vivo: um TTL malformado não
+    # pode deixar o catálogo em memória meio-purgado.
+    incoming = Graph().parse(data=image_ttl + audit_ttl, format="turtle")
+    with _mutating("images.ttl") as catalog:
+        # 1) Tira da imagem (+ nós derivados de hash/loc).
+        _purge_subject(catalog, image_iri)
+        # 2) Tira qualquer ph:Upload activity que tenha gerado essa imagem.
+        for s in list(catalog.subjects(URIRef(PROV_GEN_URI), image_iri)):
+            _purge_subject(catalog, s)
+        # 3) Mescla os novos blocos (imagem + nova activity).
+        catalog += incoming
+        # 4) Desvia pessoas novas (autora criada on-the-fly) pra identities.ttl
+        #    e listas novas inline pra lists.ttl.
+        _route_new_persons(catalog)
+        _route_new_collections(catalog)
 
 
 def remove_image_from_uploads(phash):
     """Remove triples da imagem + da sua activity de envio. Retorna nº de triples."""
-    existing = STORE.read_text(KEY_IMAGES)
-    if not existing:
-        return 0
-    v = _load_validator()
     from rdflib import URIRef
     image_iri = URIRef(MED_NS + phash)
-    catalog = v["Graph"]()
-    catalog.parse(data=existing, format="turtle")
-    n = _purge_subject(catalog, image_iri)
-    for s in list(catalog.subjects(URIRef(PROV_GEN_URI), image_iri)):
-        n += _purge_subject(catalog, s)
-    STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
+    with _mutating("images.ttl") as catalog:
+        n = _purge_subject(catalog, image_iri)
+        for s in list(catalog.subjects(URIRef(PROV_GEN_URI), image_iri)):
+            n += _purge_subject(catalog, s)
     return n
 
 
@@ -995,10 +1247,9 @@ def synthesize_media_patch(media_iri, patch_ttl, remove_preds):
     preds_to_replace = set(patch.predicates(media_uri)) | set(remove_preds)
 
     result = Graph()
-    existing = STORE.read_text(KEY_IMAGES)
-    if existing:
-        from rdflib import BNode
-        catalog = Graph().parse(data=existing, format="turtle")
+    from rdflib import BNode
+    with _state_lock:   # leitura do grafo vivo — sob o lock (ver _dump_graph)
+        catalog = _dump_graph("images.ttl")
         for subj in {media_uri} | _derived_subjects(catalog, media_uri):
             for s, p, o in catalog.triples((subj, None, None)):
                 result.add((s, p, o))
@@ -1029,14 +1280,11 @@ def upsert_media_node(media_iri, node_ttl):
     Graph = v["Graph"]
     from rdflib import URIRef
     media_uri = URIRef(media_iri)
-    catalog = Graph()
-    existing = STORE.read_text(KEY_IMAGES)
-    if existing:
-        catalog.parse(data=existing, format="turtle")
-    _purge_subject(catalog, media_uri)
-    catalog += Graph().parse(data=node_ttl, format="turtle")
-    _route_new_collections(catalog)   # listas novas inline → lists.ttl
-    STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
+    incoming = Graph().parse(data=node_ttl, format="turtle")
+    with _mutating("images.ttl") as catalog:
+        _purge_subject(catalog, media_uri)
+        catalog += incoming
+        _route_new_collections(catalog)   # listas novas inline → lists.ttl
 
 
 # ── Tour upserts ─────────────────────────────────────────────────────────
@@ -1097,10 +1345,13 @@ def validate_tour_ttl(ttl_text):
     tour_uri = URIRef(PAS_NS + tour_id)
     catalog = _load_catalog()
     exclude = {tour_uri} | _derived_subjects(catalog, tour_uri)
-    merged = data + v["ont"]
-    for s, p, o in catalog:
-        if s not in exclude:
-            merged.add((s, p, o))
+    # Além dos tipos dos nós referenciados, as arestas ph:inSeriesEdition dos
+    # OUTROS passeios que apontam pras edições deste (SeriesEditionShape:
+    # exatamente um passeio por edição).
+    own_subjects = set(data.subjects())
+    merged = _validation_universe(
+        data, catalog, exclude, own_subjects,
+        inverse_preds=(URIRef(PH_NS + "inSeriesEdition"),))
 
     with _validate_lock:   # pyshacl não é thread-safe (parser SPARQL) — ver _validate_lock
         conforms, results_graph, _txt = v["pyshacl"].validate(
@@ -1130,17 +1381,14 @@ def upsert_tour_in_tours_ttl(tour_ttl, tour_id):
     Graph = v["Graph"]
     from rdflib import URIRef
     tour_iri = URIRef(PAS_NS + tour_id)
-    catalog = Graph()
-    existing = _load_dump_text("tours.ttl")
-    if existing:
-        catalog.parse(data=existing, format="turtle")
-    _purge_subject(catalog, tour_iri)
-    # Mescla os novos blocos (tour + eventual associação/pessoa nova).
-    catalog += Graph().parse(data=tour_ttl, format="turtle")
-    # Desvia pessoas novas (participante/autora criada on-the-fly) pra
-    # identities.ttl — tours.ttl só referencia pessoas, não as define.
-    _route_new_persons(catalog)
-    STORE.write_text(KEY_TOURS, catalog.serialize(format="turtle"))
+    incoming = Graph().parse(data=tour_ttl, format="turtle")
+    with _mutating("tours.ttl") as catalog:
+        _purge_subject(catalog, tour_iri)
+        # Mescla os novos blocos (tour + eventual associação/pessoa nova).
+        catalog += incoming
+        # Desvia pessoas novas (participante/autora criada on-the-fly) pra
+        # identities.ttl — tours.ttl só referencia pessoas, não as define.
+        _route_new_persons(catalog)
 
 
 # Prefixos aceitos no campo `remove` do mode=patch (CURIEs → IRIs).
@@ -1219,9 +1467,8 @@ def synthesize_tour_patch(patch_ttl, remove_preds, replace_image=False):
     # Estado atual do tour (subject + nós derivados energy/measured/route) em
     # tours.ttl, copiado verbatim pro documento sintetizado.
     result = Graph()
-    existing = _load_dump_text("tours.ttl")
-    if existing:
-        catalog = Graph().parse(data=existing, format="turtle")
+    with _state_lock:   # leitura do grafo vivo — sob o lock (ver _dump_graph)
+        catalog = _dump_graph("tours.ttl")
         for subj in {tour_uri} | _derived_subjects(catalog, tour_uri):
             for s, p, o in catalog.triples((subj, None, None)):
                 result.add((s, p, o))
@@ -1242,17 +1489,10 @@ def remove_tour_from_tours_ttl(tour_id):
     """Remove o tour (e bnodes alcançáveis) do tours.ttl. Não toca em pessoas
     nem associações — git history preserva e elas podem ser referenciadas
     por outros tours. Retorna nº de triples removidos."""
-    existing = _load_dump_text("tours.ttl")
-    if not existing:
-        return 0
-    v = _load_validator()
-    Graph = v["Graph"]
     from rdflib import URIRef
     tour_iri = URIRef(PAS_NS + tour_id)
-    catalog = Graph()
-    catalog.parse(data=existing, format="turtle")
-    n = _purge_subject(catalog, tour_iri)
-    STORE.write_text(KEY_TOURS, catalog.serialize(format="turtle"))
+    with _mutating("tours.ttl") as catalog:
+        n = _purge_subject(catalog, tour_iri)
     return n
 
 
@@ -1309,13 +1549,11 @@ def _current_tour_route_id(tour_id):
     (TOCTOU: um delete-tour ou re-edit concorrente durante os até ~120 s de
     IO de rede não pode ser ressuscitado/sobrescrito por um upsert cego)."""
     import rwgps
-    from rdflib import Graph as _RdfGraph, URIRef as _URIRef
-    text = _load_dump_text("tours.ttl")
-    if not text:
-        return None
+    from rdflib import URIRef as _URIRef
     try:
-        g = _RdfGraph().parse(data=text, format="turtle")
-        meta = rwgps.tour_entry_from_graph(g, _URIRef(PAS_NS + tour_id))
+        # _tours_graph: tours+identities, cacheado por digest do texto — só
+        # re-parseia depois de um commit (era um parse de 280 KB por chamada).
+        meta = rwgps.tour_entry_from_graph(_tours_graph(), _URIRef(PAS_NS + tour_id))
     except Exception:  # noqa: BLE001
         return None
     return meta["id"] if meta else None
@@ -1348,15 +1586,11 @@ def _sync_tour_route(tour_id):
     dict de status pro handler reportar ao form.
     """
     import rwgps
-    from rdflib import Graph as _RdfGraph, URIRef as _URIRef
+    from rdflib import URIRef as _URIRef
 
     tour_iri = PAS_NS + tour_id
-    text = _load_dump_text("tours.ttl")
-    if not text:
-        return {"status": "error", "error": "tours.ttl ausente"}
     try:
-        g = _RdfGraph().parse(data=text, format="turtle")
-        meta = rwgps.tour_entry_from_graph(g, _URIRef(tour_iri))
+        meta = rwgps.tour_entry_from_graph(_tours_graph(), _URIRef(tour_iri))
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"parse: {e}"}
 
@@ -1468,12 +1702,8 @@ def _resync_amora_route_tours(slug):
     velha até o próximo edit do passeio. Sem IO de rede (geometria local);
     devolve o nº de tours re-sincronizados."""
     import rwgps
-    from rdflib import Graph as _RdfGraph
-    text = _load_dump_text("tours.ttl")
-    if not text:
-        return 0
     try:
-        g = _RdfGraph().parse(data=text, format="turtle")
+        g = _tours_graph()
     except Exception:  # noqa: BLE001
         return 0
     from rdflib import Namespace
@@ -1521,7 +1751,7 @@ def reload_caches():
     (Touchar o traffic recria todas as instâncias.)"""
     global _validator
     _validator = None
-    _invalidate_catalog()
+    _reset_dump_caches()
     return jsonify(ok=True, reloaded=["validator", "catalog"])
 
 
@@ -1555,6 +1785,11 @@ def index():
                 return redirect(f"/passeio/{by_id.get(tid, tid)}", code=303)
         except Exception as e:  # noqa: BLE001
             print(f"[tour-page] alias falhou pra ?tour={tour_id}: {e}")
+    # Agente (Accept: text/markdown): o guia do site + passeios recentes, em
+    # vez do shell do app. O index.html em si segue sem Vary (pré-cacheado
+    # pelo service worker — ver _negotiated).
+    if _wants_markdown(request):
+        return _markdown_response(_render_home_markdown())
     return send_from_directory(WEB, "index.html")
 
 
@@ -1568,21 +1803,27 @@ def person_page(slug):
     página humana, que foca a pessoa pelo slug da URL. O arquivo servido é SEMPRE
     pessoas.html (slug ignorado no servidor → sem risco de path); as URLs
     relativas do app resolvem via `<base href="/">`."""
-    if _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt == "ttl":
         ttl = _resource_slice_ttl(PES_NS + slug, "identities.ttl")
         if ttl is None:
             abort(404)
-        return _conditional(Response(ttl, mimetype="text/turtle",
-                                     headers={"Cache-Control": "no-cache"}))
+        return _negotiated(Response(ttl, mimetype="text/turtle",
+                                    headers={"Cache-Control": "no-cache"}))
+    if fmt == "md":   # Accept: text/markdown → ficha da pessoa (ver _render_person_markdown)
+        md = _render_person_markdown(slug)
+        if md is None:
+            abort(404)
+        return _markdown_response(md)
     return send_from_directory(WEB, "pessoas.html")
 
 
-def _render_terms_html():
-    """Página humana do vocabulário ph: — gerada de ontology.ttl (bucket-first).
-    Cada termo ganha um âncora = seu localname, então o fragmento do IRI
-    (id.pedalhidrografi.co/terms#StillImage) rola até a definição certa depois
-    do 303 pra cá. Best-effort: se o ontology.ttl não parsear, devolve None e o
-    handler cai pro turtle."""
+def _terms_model():
+    """Modelo do vocabulário ph: lido de ontology.ttl (bucket-first) — o que a
+    página humana (HTML) e a de agente (Markdown) do /terms compartilham:
+    título/descrição/versão da ontologia + classes e propriedades ph: com
+    label, comentário, flag de deprecação e linhas de metadados (em CURIEs).
+    None se o ontology.ttl não existe (o handler cai pro turtle)."""
     from rdflib import Graph, URIRef, RDF, RDFS, Namespace
     OWL = Namespace("http://www.w3.org/2002/07/owl#")
     DCT = Namespace("http://purl.org/dc/terms/")
@@ -1603,19 +1844,20 @@ def _render_terms_html():
         "http://www.w3.org/2003/12/exif/ns#": "exif:",
         "http://purl.org/pav/": "pav:",
     }
+
     def curie(u):
         s = str(u)
         for full, pfx in NS.items():
             if s.startswith(full):
                 return pfx + s[len(full):]
         return s
-    def esc(s):
-        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
-                .replace(">", "&gt;").replace('"', "&quot;"))
+
     def label(subj):
         return next((str(o) for o in g.objects(subj, RDFS.label)), None)
+
     def comment(subj):
         return next((str(o) for o in g.objects(subj, RDFS.comment)), None)
+
     def objs(subj, pred):
         return sorted(curie(o) for o in g.objects(subj, pred))
 
@@ -1633,38 +1875,103 @@ def _render_terms_html():
          | set(g.subjects(RDF.type, OWL.DatatypeProperty)) if is_ph(s)),
         key=str)
 
-    def term_card(subj, extra_rows):
-        loc = str(subj)[len(str(PH)):]
-        lab = label(subj)
-        com = comment(subj)
+    def term(subj, extra_rows):
         dep = (subj, OWL.deprecated, None) in g \
             and next(g.objects(subj, OWL.deprecated)) \
             and str(next(g.objects(subj, OWL.deprecated))).lower() == "true"
+        return {"loc": str(subj)[len(str(PH)):], "label": label(subj),
+                "comment": comment(subj), "deprecated": bool(dep),
+                "rows": [(k, v) for k, v in extra_rows if v]}
+
+    prop_kind = {p: ("ObjectProperty" if (p, RDF.type, OWL.ObjectProperty) in g
+                     else "DatatypeProperty") for p in props}
+    return {
+        "title": title, "desc": desc, "version": ver,
+        "classes": [term(c, [
+            ("subclasse de", ", ".join(objs(c, RDFS.subClassOf)) or None),
+        ]) for c in classes],
+        "props": [term(p, [
+            ("tipo", prop_kind[p]),
+            ("domínio", ", ".join(objs(p, RDFS.domain)) or None),
+            ("imagem", ", ".join(objs(p, RDFS.range)) or None),
+            ("subpropriedade de", ", ".join(objs(p, RDFS.subPropertyOf)) or None),
+        ]) for p in props],
+    }
+
+
+def _render_terms_markdown():
+    """O vocabulário ph: em Markdown (Accept: text/markdown em /terms): mesmo
+    conteúdo da página humana — classes e propriedades com label, comentário e
+    metadados. None se o ontology.ttl não existe."""
+    m = _terms_model()
+    if m is None:
+        return None
+
+    def section(t):
+        head = f"### `ph:{t['loc']}`"
+        if t["label"]:
+            head += f" — {_md_inline(t['label'])}"
+        if t["deprecated"]:
+            head += " *(deprecado)*"
+        out = [head, ""]
+        if t["comment"]:
+            out += [str(t["comment"]).strip(), ""]
+        for k, v in t["rows"]:
+            out.append(f"- {k}: `{v}`")
+        if t["rows"]:
+            out.append("")
+        return out
+
+    out = [f"# {_md_inline(m['title'])}", ""]
+    if m["desc"]:
+        out += [str(m["desc"]).strip(), ""]
+    out.append(f"`@prefix ph: <{PH_NS}>`"
+               + (f" · versão {m['version']}" if m["version"] else ""))
+    out += ["",
+            f"Turtle completo: [{SITE_URL}terms?format=ttl]({SITE_URL}terms?format=ttl) "
+            "(ou `Accept: text/turtle` nesta URL). Cada termo dereferencia em "
+            f"`{PH_NS}<Termo>`.", "",
+            "## Classes", ""]
+    for c in m["classes"]:
+        out += section(c)
+    out += ["## Propriedades", ""]
+    for p in m["props"]:
+        out += section(p)
+    out += ["Pedal Hidrográfico · vocabulário servido de `ontology.ttl`. "
+            "Reusa PROV-O, schema.org, Dublin Core, NFO, EXIF, GeoSPARQL.", ""]
+    return "\n".join(out)
+
+
+def _render_terms_html():
+    """Página humana do vocabulário ph: — gerada de ontology.ttl (bucket-first).
+    Cada termo ganha um âncora = seu localname, então o fragmento do IRI
+    (id.pedalhidrografi.co/terms#StillImage) rola até a definição certa depois
+    do 303 pra cá. Best-effort: se o ontology.ttl não parsear, devolve None e o
+    handler cai pro turtle."""
+    m = _terms_model()
+    if m is None:
+        return None
+    title, desc, ver = m["title"], m["desc"], m["version"]
+
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;").replace('"', "&quot;"))
+
+    def term_card(t):
+        loc, lab, com = t["loc"], t["label"], t["comment"]
         rows = "".join(
             f'<div class="row"><span class="k">{esc(k)}</span>'
             f'<span class="v">{esc(v)}</span></div>'
-            for k, v in extra_rows if v)
-        badge = ' <span class="dep">deprecado</span>' if dep else ""
+            for k, v in t["rows"])
+        badge = ' <span class="dep">deprecado</span>' if t["deprecated"] else ""
         return (
             f'<section id="{esc(loc)}" class="term">'
             f'<h3><code>ph:{esc(loc)}</code>{" — " + esc(lab) if lab else ""}{badge}</h3>'
             f'{f"<p>{esc(com)}</p>" if com else ""}'
             f'<div class="meta">{rows}</div></section>')
 
-    class_html = "".join(term_card(c, [
-        ("subclasse de", ", ".join(objs(c, RDFS.subClassOf)) or None),
-    ]) for c in classes)
-    prop_kind = {}
-    for p in props:
-        prop_kind[p] = ("ObjectProperty"
-                        if (p, RDF.type, OWL.ObjectProperty) in g
-                        else "DatatypeProperty")
-    prop_html = "".join(term_card(p, [
-        ("tipo", prop_kind[p]),
-        ("domínio", ", ".join(objs(p, RDFS.domain)) or None),
-        ("imagem", ", ".join(objs(p, RDFS.range)) or None),
-        ("subpropriedade de", ", ".join(objs(p, RDFS.subPropertyOf)) or None),
-    ]) for p in props)
+    class_html = "".join(term_card(c) for c in m["classes"])
+    prop_html = "".join(term_card(p) for p in m["props"])
 
     return f"""<!doctype html><html lang="pt"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1713,23 +2020,26 @@ def terms_vocab():
     Accept: text/turtle (ou ?format=ttl) → ontology.ttl; senão a página humana
     gerada de ontology.ttl (com âncora por termo). Sem `#` no path — a CF já
     tira o fragmento antes do 303 pra cá."""
-    if _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt == "ttl":
         text = _load_dump_text("ontology.ttl")
         if text is None:
             abort(404)
-        return _conditional(Response(text, mimetype="text/turtle",
-                                     headers={"Cache-Control": "no-cache"}))
+        return _negotiated(Response(text, mimetype="text/turtle",
+                                    headers={"Cache-Control": "no-cache"}))
     try:
-        html = _render_terms_html()
+        page = _render_terms_markdown() if fmt == "md" else _render_terms_html()
     except Exception as e:  # noqa: BLE001
-        print(f"[terms] render falhou: {e}")
-        html = None
-    if html is None:  # fallback: entrega o turtle mesmo sem Accept
+        print(f"[terms] render ({fmt}) falhou: {e}")
+        page = None
+    if page is None:  # fallback: entrega o turtle mesmo sem Accept
         text = _load_dump_text("ontology.ttl") or ""
-        return _conditional(Response(text, mimetype="text/turtle",
-                                     headers={"Cache-Control": "no-cache"}))
-    return _conditional(Response(html, mimetype="text/html",
-                                 headers={"Cache-Control": "no-cache"}))
+        return _negotiated(Response(text, mimetype="text/turtle",
+                                    headers={"Cache-Control": "no-cache"}))
+    if fmt == "md":
+        return _markdown_response(page)
+    return _negotiated(Response(page, mimetype="text/html",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/listas/<slug>")
@@ -1741,7 +2051,13 @@ def list_page(slug):
     inverso); senão 303 pra galeria JÁ FILTRADA por esta lista
     (imagens.html?list=<slug> — a galeria pré-seleciona a faceta Listas)."""
     list_iri = LST_NS + slug
-    if not _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt == "md":   # Accept: text/markdown → a lista + membros (ver _render_list_markdown)
+        md = _render_list_markdown(slug)
+        if md is None:
+            abort(404)
+        return _markdown_response(md)
+    if fmt != "ttl":
         from urllib.parse import quote
         return redirect(f"/imagens.html?list={quote(slug, safe='')}", code=303)
     from rdflib import URIRef, Literal
@@ -1765,9 +2081,9 @@ def list_page(slug):
             out.add((lu, HASPART, m))
     if len(out) == 0:
         abort(404)
-    return _conditional(Response(out.serialize(format="turtle"),
-                                 mimetype="text/turtle",
-                                 headers={"Cache-Control": "no-cache"}))
+    return _negotiated(Response(out.serialize(format="turtle"),
+                                mimetype="text/turtle",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/passeio/<slug>")
@@ -1794,26 +2110,95 @@ def tour_page(slug):
         legacy = _tour_iri_map().get("byOldId", {}).get(slug)
         if legacy:
             return redirect(f"/passeio/{by_id.get(legacy, legacy)}", code=303)
-    if _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt == "ttl":
         ttl = _resource_slice_ttl(PAS_NS + tour_id, "tours.ttl")
         if ttl is None:
             abort(404)
-        return _conditional(Response(ttl, mimetype="text/turtle",
-                                     headers={"Cache-Control": "no-cache"}))
+        return _negotiated(Response(ttl, mimetype="text/turtle",
+                                    headers={"Cache-Control": "no-cache"}))
     pretty = by_id.get(tour_id)
     if pretty and not via_pretty:
         return redirect(f"/passeio/{pretty}", code=303)
+    if fmt == "md":
+        # Agente: 404 seco pra passeio desconhecido — o 303 pro deep link
+        # antigo (abaixo) só faz sentido pro app, que abre o toast.
+        try:
+            md = _render_tour_markdown(tour_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[tour-page] render markdown falhou pra {tour_id}: {e}")
+            abort(500)
+        if md is None:
+            abort(404)
+        return _markdown_response(md)
     try:
         page = _render_tour_index(tour_id)
     except Exception as e:  # noqa: BLE001
         print(f"[tour-page] render falhou pra {tour_id}: {e}")
         page = None
     if page is not None:
-        return _conditional(Response(page, mimetype="text/html",
-                                     headers={"Cache-Control": "no-cache"}))
+        return _negotiated(Response(page, mimetype="text/html",
+                                    headers={"Cache-Control": "no-cache"}))
     # Passeio desconhecido (ou render falhou): cai pro deep link antigo — o
     # app abre com o toast de "não encontrado" em vez de um 404 seco.
     return redirect(f"/?tour={slug}", code=303)
+
+
+def _series_rows(g, editions):
+    """Linhas (seq, segmento, título, data, slug do passeio) das edições de uma
+    série, mais recente primeiro — compartilhadas pelas páginas HTML e
+    Markdown da série."""
+    from rdflib import Namespace
+    DCT = Namespace("http://purl.org/dc/terms/")
+    PH = Namespace(PH_NS)
+    INSERIES = PH.inSeriesEdition
+    SEQ = PH.sequenceInSeries
+    rows = []
+    for ed in editions:
+        seq_lit = g.value(ed, SEQ)
+        try:
+            seq_n = int(seq_lit)
+        except (TypeError, ValueError):
+            seq_n = 0
+        seg = str(ed)[len(PAS_NS):]   # "<ES>/<n>" — segmento pro link da edição
+        realizer = next(iter(g.subjects(INSERIES, ed)), None)
+        tour_title = str(g.value(realizer, DCT.title)) if realizer is not None else None
+        tour_date = g.value(realizer, DCT.date) if realizer is not None else None
+        tour_slug = None
+        if realizer is not None:
+            tour_slug = (_tour_pretty_of(g, realizer)
+                         or str(realizer)[len(PAS_NS):])
+        rows.append((seq_n, seg, tour_title, tour_date, tour_slug))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    return rows
+
+
+def _render_series_markdown(g, series_iri, es, editions):
+    """A série em Markdown (Accept: text/markdown): edições mais recentes
+    primeiro, cada uma linkando pro passeio que a realizou."""
+    from rdflib import Namespace
+    DCT = Namespace("http://purl.org/dc/terms/")
+    title = _md_inline(g.value(series_iri, DCT.title) or es)
+    rows = _series_rows(g, editions)
+    n = len(rows)
+    out = [f"# {title}", "",
+           f"Série de eventos do Pedal Hidrográfico (`ser:{es}`) · {n} "
+           f"{'edições' if n != 1 else 'edição'}, mais recentes primeiro.", ""]
+    for seq_n, seg, tour_title, tour_date, tour_slug in rows:
+        label = _md_inline(tour_title) or "(passeio sem título)"
+        date_s = str(tour_date)[:10] if tour_date else ""
+        link = f"{SITE_URL}passeio/{tour_slug or seg}"
+        out.append(f"- [{es} {seq_n}]({link}) — {label}"
+                   + (f" · {date_s}" if date_s else ""))
+    if not rows:
+        out.append("Sem edições.")
+    out += ["", "## Dados", "",
+            f"- **IRI:** `{SER_NS}{es}`",
+            f"- **RDF (Turtle):** [{SITE_URL}serie/{es}?format=ttl]"
+            f"({SITE_URL}serie/{es}?format=ttl) — ou `Accept: text/turtle` na mesma URL",
+            f"- Cada edição também dereferencia: `{PAS_NS}{es}/<nº>` (303 pro passeio)",
+            ""]
+    return "\n".join(out)
 
 
 def _render_series_html(g, series_iri, es, editions):
@@ -1833,23 +2218,7 @@ def _render_series_html(g, series_iri, es, editions):
 
     title = str(g.value(series_iri, DCT.title) or es)
 
-    rows = []
-    for ed in editions:
-        seq_lit = g.value(ed, SEQ)
-        try:
-            seq_n = int(seq_lit)
-        except (TypeError, ValueError):
-            seq_n = 0
-        seg = str(ed)[len(PAS_NS):]   # "<ES>/<n>" — segmento pro link da edição
-        realizer = next(iter(g.subjects(INSERIES, ed)), None)
-        tour_title = str(g.value(realizer, DCT.title)) if realizer is not None else None
-        tour_date = g.value(realizer, DCT.date) if realizer is not None else None
-        tour_slug = None
-        if realizer is not None:
-            tour_slug = (_tour_pretty_of(g, realizer)
-                         or str(realizer)[len(PAS_NS):])
-        rows.append((seq_n, seg, tour_title, tour_date, tour_slug))
-    rows.sort(key=lambda r: r[0], reverse=True)
+    rows = _series_rows(g, editions)
 
     def row_html(seq_n, seg, tour_title, tour_date, tour_slug):
         label = tour_title or "(passeio sem título)"
@@ -1884,7 +2253,7 @@ footer{{margin-top:2rem;color:#7d8296;font-size:.82rem}}
 </style></head><body><div class="wrap">
 <header>
 <h1>{esc(title)}</h1>
-<p class="lede"><code>ser:{esc(es)}</code> · {len(rows)} edição{'ões' if len(rows) != 1 else ''}</p>
+<p class="lede"><code>ser:{esc(es)}</code> · {len(rows)} {'edições' if len(rows) != 1 else 'edição'}</p>
 <p class="ttl-link"><a href="/serie/{esc(es)}?format=ttl">↓ Turtle</a></p>
 </header>
 {rows_html}
@@ -1912,15 +2281,19 @@ def series_page(es):
     INEVENTSERIES = URIRef(PH_NS + "inEventSeries")
     INSERIES = URIRef(PH_NS + "inSeriesEdition")
     editions = list(g.subjects(INEVENTSERIES, series_iri))
-    if not _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt != "ttl":
         try:
-            html = _render_series_html(g, series_iri, es, editions)
+            page = (_render_series_markdown if fmt == "md"
+                    else _render_series_html)(g, series_iri, es, editions)
         except Exception as e:  # noqa: BLE001
-            print(f"[series] render falhou pra ser:{es}: {e}")
-            html = None
-        if html is not None:
-            return _conditional(Response(html, mimetype="text/html",
-                                         headers={"Cache-Control": "no-cache"}))
+            print(f"[series] render ({fmt}) falhou pra ser:{es}: {e}")
+            page = None
+        if page is not None:
+            if fmt == "md":
+                return _markdown_response(page)
+            return _negotiated(Response(page, mimetype="text/html",
+                                        headers={"Cache-Control": "no-cache"}))
     out = Graph()
     for pfx, ns in (("pas", PAS_NS), ("ser", SER_NS), ("ph", PH_NS),
                     ("dcterms", "http://purl.org/dc/terms/")):
@@ -1933,9 +2306,9 @@ def series_page(es):
         realizer = next(iter(g.subjects(INSERIES, ed)), None)
         if realizer is not None:
             out.add((realizer, INSERIES, ed))
-    return _conditional(Response(out.serialize(format="turtle"),
-                                 mimetype="text/turtle",
-                                 headers={"Cache-Control": "no-cache"}))
+    return _negotiated(Response(out.serialize(format="turtle"),
+                                mimetype="text/turtle",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/passeio/<es>/<seq>")
@@ -1970,9 +2343,9 @@ def edition_page(es, seq):
         abort(404)
     if realizer is not None:
         out.add((realizer, INSERIES, ed))
-    return _conditional(Response(out.serialize(format="turtle"),
-                                 mimetype="text/turtle",
-                                 headers={"Cache-Control": "no-cache"}))
+    return _negotiated(Response(out.serialize(format="turtle"),
+                                mimetype="text/turtle",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/midia/<local>")
@@ -1989,13 +2362,19 @@ def media_page(local):
             break
     if len(local) != 16 or not all(c in "0123456789abcdef" for c in local.lower()):
         abort(404)
-    if not _wants_turtle(request):
+    fmt = _negotiated_format(request)
+    if fmt == "md":   # Accept: text/markdown → ficha da mídia (ver _render_media_markdown)
+        md = _render_media_markdown(local)
+        if md is None:
+            abort(404)
+        return _markdown_response(md)
+    if fmt != "ttl":
         return redirect("/imagens.html?pick=" + local, code=303)
     ttl = _resource_slice_ttl(MED_NS + local, "images.ttl")
     if ttl is None:
         abort(404)
-    return _conditional(Response(ttl, mimetype="text/turtle",
-                                 headers={"Cache-Control": "no-cache"}))
+    return _negotiated(Response(ttl, mimetype="text/turtle",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/data/<filename>")
@@ -2579,11 +2958,34 @@ def _og_cache_put(key, png):
         _route_og_cache.pop(next(iter(_route_og_cache)))
 
 
+_og_render_lock = threading.RLock()   # um render por vez (thread do save × GET lazy)
+
+
 def _refresh_route_og(rid, r=None):
-    """(Re)renderiza e PERSISTE o card OG da rota `rid` no store. Chamado no
-    fim do /save-route e, lazy, no primeiro GET de uma rota salva antes do
-    pré-render existir. Falha → apaga o blob antigo (melhor card nenhum do
-    que o card de um traçado que já mudou) e devolve None."""
+    """(Re)renderiza e PERSISTE o card OG da rota `rid` no store. Chamado em
+    thread pelo /save-route (ver _refresh_route_og_async) e, lazy, no primeiro
+    GET de uma rota antes do pré-render existir. Falha → apaga o blob antigo
+    (melhor card nenhum do que o card de um traçado que já mudou) e devolve
+    None. Serializado por _og_render_lock."""
+    with _og_render_lock:
+        return _render_and_store_route_og(rid, r)
+
+
+def _refresh_route_og_async(rid, r):
+    """Pré-render do card OG DEPOIS da resposta do /save-route: FGB por range
+    request + Pillow levam ~2 s e o usuário esperava isso tudo pra ver o
+    link/QR. Best-effort — o GET do og.png segue com o render lazy como rede
+    de segurança (no Cloud Run a CPU fora de request é throttled e a thread
+    pode demorar; o lazy cobre, e o _og_render_lock evita render duplo)."""
+    def _run():
+        try:
+            _refresh_route_og(rid, r)
+        except Exception as e:  # noqa: BLE001
+            print(f"[route-og] pré-render em thread falhou pra {rid}: {e}")
+    threading.Thread(target=_run, name=f"route-og-{rid}", daemon=True).start()
+
+
+def _render_and_store_route_og(rid, r=None):
     if r is None:
         _, r = _find_saved_route(rid)
     if not isinstance(r, dict) or not isinstance(r.get("state"), dict):
@@ -2627,7 +3029,9 @@ def route_og_png(slug):
         if png is not None:
             _og_cache_put(key, png)
     if png is None:
-        png = _refresh_route_og(rid, r)
+        with _og_render_lock:
+            # A thread do /save-route pode ter acabado de renderizar este card.
+            png = _route_og_cache.get(key) or _refresh_route_og(rid, r)
     if png is None:
         abort(404)
     return Response(png, mimetype="image/png",
@@ -2647,9 +3051,9 @@ def save_route():
     (re-salva com esse id) ou trocar o nome.
 
     SEM @serialized de propósito: só o miolo read-modify-write roda sob o
-    _state_lock. O resync dos tours (trava por conta própria) e o PRÉ-RENDER
-    do card OG (FGB + Pillow — segundos) rodam DEPOIS, fora do lock mas ainda
-    no request (a CPU do Cloud Run só é garantida durante requests)."""
+    _state_lock. O resync dos tours (trava por conta própria) roda depois,
+    fora do lock; o PRÉ-RENDER do card OG (FGB + Pillow — ~2 s) vai pra uma
+    thread depois da resposta (ver _refresh_route_og_async)."""
     data = request.get_json(silent=True) or {}
     state = data.get("state")
     if (not isinstance(state, dict) or not isinstance(state.get("wp"), list)
@@ -2714,11 +3118,8 @@ def save_route():
         synced = _resync_amora_route_tours(slug)
     except Exception as e:  # noqa: BLE001
         print(f"[save-route] resync de tours falhou: {e}")
-    # Pré-render do card OG (WhatsApp/redes) — fora do lock, best-effort.
-    try:
-        _refresh_route_og(rid, routes[rid])
-    except Exception as e:  # noqa: BLE001
-        print(f"[save-route] pré-render do card OG falhou: {e}")
+    # Pré-render do card OG (WhatsApp/redes) em thread, depois da resposta.
+    _refresh_route_og_async(rid, routes[rid])
     return jsonify(id=rid, slug=slug, syncedTours=synced)
 
 
@@ -3149,39 +3550,11 @@ def _render_tour_index(tour_id):
     if (t, RDF.type, PH.Tour) not in g:
         return None
 
-    title = _tour_display_title(g, t)
-    # URL canônica: o slug legível (schema:identifier) quando existe, senão o
-    # slug8 — mesmo formato do sitemap/feed/compartilhar.
-    page_url = f"{SITE_URL}passeio/{_tour_pretty_of(g, t) or tour_id}"
-
-    date = g.value(t, DCT.date)
-    try:
-        dt = datetime.fromisoformat(str(date)) if date else None
-    except ValueError:
-        dt = None
-    date_label = f"{dt.day} de {_MONTHS_PT[dt.month - 1]} de {dt.year}" if dt else None
-
-    narrative = str(g.value(t, DCT.description) or "").strip()
-    img = g.value(t, SCHEMA.image)
-    img_url = str(img) if img else None
-
-    energy_line = None
-    kj = g.value(t, PH.energyEstimate)
-    if kj is not None:
-        try:
-            kj_val = float(kj)
-        except (TypeError, ValueError):
-            # Forma legada (IRI de QuantityValue) ou lixo — não derruba o
-            # SSR do passeio inteiro por causa de um dado malformado.
-            kj_val = None
-        if kj_val is not None:
-            intensity = _intensity_for(kj_val)
-            energy_line = (f"{kj_val:.0f} quilojaules"
-                           + (f" ({intensity})" if intensity else ""))
-    route_ref = g.value(t, PH.linkRoute)
-    route_url = g.value(route_ref, SCHEMA.url) if route_ref else None
-    ig_url = g.value(t, PH.linkInstagram)
-    authors = sorted(_person_name(g, p) for p in g.objects(t, PROV.wasAttributedTo))
+    # Fatos compartilhados com a representação Markdown (ver _tour_facts).
+    d = _tour_facts(g, t)
+    title, page_url, dt, date_label = d["title"], d["page_url"], d["dt"], d["date_label"]
+    narrative, img_url, energy_line = d["narrative"], d["img_url"], d["energy_line"]
+    route_url, ig_url, authors = d["route_url"], d["ig_url"], d["author_names"]
 
     # Descrição pra <meta>/OG: primeiro parágrafo da narrativa (truncado),
     # senão um resumo do que houver.
@@ -3263,7 +3636,8 @@ def _render_tour_index(tour_id):
     # URLs relativas do app (./app.js, ./data/…) resolverem na raiz do host,
     # como em pessoas.html. CSP tem base-uri 'self'; os href="#" do app são
     # todos preventDefault'ados, então o base não os transforma em navegação.
-    html_text = html_text.replace("<head>", '<head>\n    <base href="/">', 1)
+    if "<base " not in html_text:   # index.html já traz o <base> (idempotente)
+        html_text = html_text.replace("<head>", '<head>\n    <base href="/">', 1)
 
     def attr(pattern, value, text):
         # lambda no replacement: o valor pode conter '\' e '\1' literais.
@@ -3294,6 +3668,465 @@ def _render_tour_index(tour_id):
     html_text = html_text.replace("</head>", "    " + jsonld_tag + "\n  </head>", 1)
     html_text = html_text.replace("</body>", article + "\n</body>", 1)
     return html_text
+
+
+# ── Markdown pra agentes: fatos de passeio + renderers ─────────────────────
+# Accept: text/markdown nas páginas (ver _negotiated_format). Os renderers
+# leem os mesmos grafos cacheados do SSR (_tours_graph: tours+identities;
+# _load_catalog: os 4 dumps, pra mídia/lista/pessoa) e escrevem Markdown
+# simples — links absolutos em SITE_URL, ficha em lista, narrativa em
+# parágrafos. Nunca escapam o texto do catálogo: é dado do coletivo.
+
+def _tour_facts(g, t):
+    """Fatos de um passeio (grafo tours+identities) que as representações
+    humana e de agente compartilham — SSR HTML, Markdown do passeio, Memória e
+    home em Markdown. Best-effort campo a campo: dado malformado vira None,
+    nunca derruba a página."""
+    import re
+    from rdflib import Namespace
+    PH = Namespace(PH_NS)
+    SCHEMA = Namespace("https://schema.org/")
+    DCT = Namespace("http://purl.org/dc/terms/")
+    PROV = Namespace("http://www.w3.org/ns/prov#")
+
+    def dt_of(v):
+        try:
+            return datetime.fromisoformat(str(v)) if v else None
+        except ValueError:
+            return None
+
+    def num(v):
+        # Forma legada (IRI de QuantityValue) ou lixo → None, sem derrubar o
+        # SSR do passeio inteiro por causa de um dado malformado.
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def count(v):
+        try:
+            return int(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def hhmm(secs):
+        h, mi = int(secs // 3600), int(secs % 3600 // 60)
+        return f"{h}h{mi:02d}" if h else f"{mi}min"
+
+    tour_id = (str(t)[len(PAS_NS):] if str(t).startswith(PAS_NS)
+               else str(t).rsplit("/", 1)[-1])
+    pretty = _tour_pretty_of(g, t)
+    dt = dt_of(g.value(t, DCT.date))
+    narrative = str(g.value(t, DCT.description) or "").strip()
+    img = g.value(t, SCHEMA.image)
+    energy = num(g.value(t, PH.energyEstimate))
+    intensity = _intensity_for(energy) if energy is not None else None
+    route_ref = g.value(t, PH.linkRoute)
+    route_url = g.value(route_ref, SCHEMA.url) if route_ref else None
+    ig_url = g.value(t, PH.linkInstagram)
+    authors = sorted(
+        (_person_name(g, p),
+         str(p)[len(PES_NS):] if str(p).startswith(PES_NS) else None)
+        for p in g.objects(t, PROV.wasAttributedTo))
+    editions = []
+    for ed in g.objects(t, PH.inSeriesEdition):
+        ev = g.value(ed, PH.inEventSeries)
+        seq = g.value(ed, PH.sequenceInSeries)
+        if ev is not None and seq is not None:
+            editions.append((str(ev).split("/")[-1].split("#")[-1], str(seq)))
+    editions.sort()
+    departed = dt_of(g.value(t, PH.departedAt))
+    arrived = dt_of(g.value(t, PH.arrivedAt))
+    # Tempo total: derivado de chegada − saída quando os dois existem (e são
+    # comparáveis — naive e aware não se subtraem); senão o literal
+    # ph:totalDuration, que é o fallback por convenção.
+    total = None
+    if (departed and arrived
+            and (departed.tzinfo is None) == (arrived.tzinfo is None)):
+        secs = (arrived - departed).total_seconds()
+        if secs > 0:
+            total = hhmm(secs)
+    if total is None:
+        total_lit = g.value(t, PH.totalDuration)
+        total = _fmt_moving_duration(total_lit) if total_lit else None
+    moving_lit = g.value(t, PH.movingDuration)
+    return {
+        "id": tour_id, "pretty": pretty, "iri": str(t),
+        "title": _tour_display_title(g, t),
+        # URL canônica: o slug legível (schema:identifier) quando existe, senão
+        # o slug8 — mesmo formato do sitemap/feed/compartilhar.
+        "page_url": f"{SITE_URL}passeio/{pretty or tour_id}",
+        "dt": dt,
+        "date_label": (f"{dt.day} de {_MONTHS_PT[dt.month - 1]} de {dt.year}"
+                       if dt else None),
+        "narrative": narrative,
+        "paragraphs": [p.strip() for p in re.split(r"\r?\n+", narrative) if p.strip()],
+        "img_url": str(img) if img else None,
+        "energy": energy, "intensity": intensity,
+        "energy_line": ((f"{energy:.0f} quilojaules"
+                         + (f" ({intensity})" if intensity else ""))
+                        if energy is not None else None),
+        "measured": num(g.value(t, PH.measuredEnergy)),
+        "route_url": str(route_url) if route_url else None,
+        "ig_url": str(ig_url) if ig_url else None,
+        "authors": authors,                       # [(nome, slug | None)]
+        "author_names": [a[0] for a in authors],
+        "editions": editions,                     # [(código da série, nº)]
+        "attendees": count(g.value(t, PH.countAttendee)),
+        "newcomers": count(g.value(t, PH.countNewcomer)),
+        "departed": departed, "arrived": arrived,
+        "total": total,
+        "moving": _fmt_moving_duration(moving_lit) if moving_lit else None,
+    }
+
+
+def _tours_sorted():
+    """Todos os passeios como _tour_facts, mais recentes primeiro."""
+    from rdflib import Namespace, RDF
+    g = _tours_graph()
+    facts = [_tour_facts(g, t) for t in g.subjects(RDF.type, Namespace(PH_NS).Tour)]
+    facts.sort(key=lambda d: _tour_date_sort_key(d["dt"]), reverse=True)
+    return facts
+
+
+def _tour_md_meta_line(d):
+    """Linha de fatos de um passeio (data · energia · gente · rota · IG) pras
+    listas em Markdown (home, Memória)."""
+    bits = []
+    if d["date_label"]:
+        bits.append(d["date_label"])
+    if d["energy_line"]:
+        bits.append(d["energy_line"].replace("quilojaules", "kJ"))
+    if d["measured"] is not None:
+        bits.append(f"{d['measured']:.0f} kJ medidos")
+    if d["attendees"] is not None:
+        bits.append(f"{d['attendees']} pessoas")
+    if d["route_url"]:
+        bits.append(f"[Rota]({d['route_url']})")
+    if d["ig_url"]:
+        bits.append(f"[Instagram]({d['ig_url']})")
+    return " · ".join(bits)
+
+
+def _render_tour_markdown(tour_id):
+    """A página do passeio em Markdown (Accept: text/markdown): o mesmo
+    conteúdo do <article> SSR'ado, mais a ficha completa (série, energias,
+    horários, participantes) e os ponteiros pros dados — sem o chrome do app.
+    None se o passeio não existe."""
+    from rdflib import Namespace, RDF, URIRef
+    g = _tours_graph()
+    t = URIRef(PAS_NS + tour_id)
+    if (t, RDF.type, Namespace(PH_NS).Tour) not in g:
+        return None
+    d = _tour_facts(g, t)
+    title = _md_inline(d["title"])
+    out = [f"# {title}", "",
+           " · ".join(b for b in (d["date_label"], "Pedal Hidrográfico") if b), ""]
+    if d["img_url"]:
+        out += [f"![Arte do chamado — {title}]({d['img_url']})", ""]
+    for para in d["paragraphs"]:
+        out += [para, ""]
+    facts = []
+    if d["dt"]:
+        facts.append(f"- **Data:** {d['date_label']} (`{d['dt'].isoformat()}`)")
+    for code, seq in d["editions"]:
+        facts.append(f"- **Edição:** {code} {seq} — [série {code}]({SITE_URL}serie/{code})")
+    if d["energy_line"]:
+        facts.append("- **Energia estimada:** "
+                     + d["energy_line"].replace("quilojaules", "kJ"))
+    if d["measured"] is not None:
+        facts.append(f"- **Energia medida:** {d['measured']:.0f} kJ")
+    if d["departed"] or d["arrived"]:
+        dep = d["departed"].strftime("%H:%M") if d["departed"] else "?"
+        arr = d["arrived"].strftime("%H:%M") if d["arrived"] else "?"
+        facts.append(f"- **Saída → chegada:** {dep} → {arr}"
+                     + (f" ({d['total']} no total)" if d["total"] else ""))
+    elif d["total"]:
+        facts.append(f"- **Tempo total:** {d['total']}")
+    if d["moving"]:
+        facts.append(f"- **Tempo em movimento:** {d['moving']}")
+    if d["attendees"] is not None:
+        who = f"{d['attendees']} pessoas"
+        if d["newcomers"] is not None:
+            who += f", {d['newcomers']} pela primeira vez"
+        facts.append(f"- **Participantes:** {who}")
+    if d["route_url"]:
+        facts.append(f"- **Rota:** <{d['route_url']}>")
+    if d["ig_url"]:
+        facts.append(f"- **Instagram:** <{d['ig_url']}>")
+    if d["authors"]:
+        names = ", ".join(
+            f"[{_md_inline(n)}]({SITE_URL}pessoas/{s})" if s else _md_inline(n)
+            for n, s in d["authors"])
+        facts.append(f"- **Alguns elaboradores:** {names}")
+    if facts:
+        out += ["## Ficha", "", *facts, ""]
+    out += ["## Dados", "",
+            f"- **IRI:** `{d['iri']}`",
+            f"- **RDF (Turtle):** [{d['page_url']}?format=ttl]({d['page_url']}?format=ttl)"
+            " — ou `Accept: text/turtle` na mesma URL",
+            f"- [Este passeio na Memória Hidrográfica]({SITE_URL}memoria.html#{d['id']})",
+            f"- [Mapa do Pedal Hidrográfico]({SITE_URL})", ""]
+    return "\n".join(out)
+
+
+HOME_MD_RECENT_TOURS = 20
+
+
+def _render_home_markdown():
+    """A home em Markdown (Accept: text/markdown em `/`): o llms.txt — o guia
+    do site pra agentes, que já é Markdown — mais a lista dos passeios mais
+    recentes, cada um linkando pra sua página (que também negocia Markdown).
+    É o que um agente lê ao chegar aqui, em vez do shell do app (mapa +
+    modais, vazio de conteúdo sem JS)."""
+    guide = (WEB / "llms.txt").read_text(encoding="utf-8").strip()
+    try:
+        tours = _tours_sorted()
+    except Exception as e:  # noqa: BLE001
+        print(f"[home-md] catálogo de passeios falhou: {e}")
+        tours = []
+    out = [guide, "", "## Passeios recentes", ""]
+    for d in tours[:HOME_MD_RECENT_TOURS]:
+        out.append(f"- [{_md_inline(d['title'])}]({d['page_url']}) — {_tour_md_meta_line(d)}")
+    if tours:
+        out += ["", f"Todos os {len(tours)} passeios, com narrativa: "
+                    f"[Memória Hidrográfica]({SITE_URL}memoria.html) "
+                    "(também em Markdown com `Accept: text/markdown`)."]
+    else:
+        out.append("(catálogo de passeios indisponível no momento)")
+    out.append("")
+    return "\n".join(out)
+
+
+def _render_person_markdown(slug):
+    """Ficha da pessoa em Markdown: nome/apelido/links (identities.ttl), os
+    passeios que elaborou (tours.ttl) e quantas mídias assinou (images.ttl,
+    via o catálogo cacheado). None se a pessoa não existe."""
+    from rdflib import Namespace, RDF, RDFS, URIRef
+    SCHEMA = Namespace("https://schema.org/")
+    PROV = Namespace("http://www.w3.org/ns/prov#")
+    PH = Namespace(PH_NS)
+    g = _tours_graph()
+    p = URIRef(PES_NS + slug)
+    if (p, RDF.type, SCHEMA.Person) not in g:
+        return None
+    name = _md_inline(_person_name(g, p))
+    out = [f"# {name}", "", "Pessoa do Pedal Hidrográfico.", ""]
+    facts = []
+    alt = g.value(p, SCHEMA.alternateName)
+    if alt and _md_inline(alt) != name:
+        facts.append(f"- **Apelido:** {_md_inline(alt)}")
+    for pred, label in ((RDFS.seeAlso, "Ver também"), (SCHEMA.sameAs, "Mesmo que"),
+                        (SCHEMA.url, "Site")):
+        for o in sorted(str(o) for o in g.objects(p, pred)):
+            facts.append(f"- **{label}:** <{o}>")
+    if facts:
+        out += [*facts, ""]
+    tours = [_tour_facts(g, t) for t in g.subjects(PROV.wasAttributedTo, p)
+             if (t, RDF.type, PH.Tour) in g]
+    tours.sort(key=lambda d: _tour_date_sort_key(d["dt"]), reverse=True)
+    out += [f"## Passeios elaborados ({len(tours)})", ""]
+    for d in tours:
+        out.append(f"- [{_md_inline(d['title'])}]({d['page_url']}) — {_tour_md_meta_line(d)}")
+    if not tours:
+        out.append("Nenhum passeio registrado com esta pessoa na elaboração.")
+    try:
+        cat = _load_catalog()
+        signed = list(cat.subjects(PROV.wasAttributedTo, p))
+        stills = sum(1 for m in signed if (m, RDF.type, PH.StillImage) in cat)
+        videos = sum(1 for m in signed if (m, RDF.type, PH.MotionImage) in cat)
+        out += ["", "## Mídias", "",
+                f"Assinou {stills} foto{'s' if stills != 1 else ''} e {videos} "
+                f"vídeo{'s' if videos != 1 else ''} do acervo "
+                f"([galeria]({SITE_URL}imagens.html))."]
+    except Exception as e:  # noqa: BLE001
+        print(f"[person-md] contagem de mídias falhou pra {slug}: {e}")
+    out += ["", "## Dados", "",
+            f"- **IRI:** `{PES_NS}{slug}`",
+            f"- **RDF (Turtle):** [{SITE_URL}pessoas/{slug}?format=ttl]"
+            f"({SITE_URL}pessoas/{slug}?format=ttl) — ou `Accept: text/turtle` na mesma URL",
+            f"- [Página no app]({SITE_URL}pessoas/{slug})", ""]
+    return "\n".join(out)
+
+
+def _render_list_markdown(slug):
+    """Lista/álbum em Markdown: nome + membros (mídias com schema:isPartOf →
+    a lista), cada um linkando pra sua página e pro passeio em que foi
+    capturado. Lê o catálogo cacheado (lists + images + tours). None se a
+    lista não existe."""
+    from rdflib import Namespace, RDF, URIRef
+    SCHEMA = Namespace(SCHEMA_NS)
+    PH = Namespace(PH_NS)
+    DCT = Namespace("http://purl.org/dc/terms/")
+    cat = _load_catalog()
+    lu = URIRef(LST_NS + slug)
+    if (lu, None, None) not in cat:
+        return None
+    name = _md_inline(cat.value(lu, SCHEMA.name) or slug)
+    desc = cat.value(lu, SCHEMA.description)
+    members = []
+    for m in cat.subjects(SCHEMA.isPartOf, lu):
+        if (m, RDF.type, PH.MotionImage) in cat:
+            kind = "vídeo"
+        elif (m, RDF.type, PH.StillImage) in cat:
+            kind = "foto"
+        else:
+            kind = "mídia"
+        local = str(m)[len(MED_NS):] if str(m).startswith(MED_NS) else str(m)
+        members.append((str(cat.value(m, DCT.date) or ""), kind, local,
+                        cat.value(m, PH.capturedDuring)))
+    members.sort(key=lambda x: (x[0], x[2]), reverse=True)
+    n = len(members)
+    out = [f"# {name}", "",
+           f"Lista/álbum do acervo do Pedal Hidrográfico (`lst:{slug}`) · {n} "
+           f"mídia{'s' if n != 1 else ''}.", ""]
+    if desc:
+        out += [str(desc).strip(), ""]
+    out += ["## Mídias", ""]
+    for date, kind, local, tour in members:
+        line = f"- [{kind} {local}]({SITE_URL}midia/{local})"
+        if date:
+            line += f" — {date[:10]}"
+        if tour is not None and (tour, RDF.type, PH.Tour) in cat:
+            tid = str(tour)[len(PAS_NS):] if str(tour).startswith(PAS_NS) else str(tour)
+            line += (f" · [{_md_inline(_tour_display_title(cat, tour))}]"
+                     f"({SITE_URL}passeio/{_tour_pretty_of(cat, tour) or tid})")
+        out.append(line)
+    if not members:
+        out.append("Lista vazia.")
+    out += ["", "## Dados", "",
+            f"- **IRI:** `{LST_NS}{slug}`",
+            f"- **RDF (Turtle):** [{SITE_URL}listas/{slug}?format=ttl]"
+            f"({SITE_URL}listas/{slug}?format=ttl) — ou `Accept: text/turtle` na mesma URL",
+            f"- [Galeria filtrada por esta lista]({SITE_URL}imagens.html?list={slug})", ""]
+    return "\n".join(out)
+
+
+def _render_media_markdown(local):
+    """Ficha de uma mídia (foto/vídeo) em Markdown: tipo, data, local, passeio,
+    autoria, licença, listas e arquivos. Lê o catálogo cacheado. None se a
+    mídia não existe."""
+    from rdflib import Namespace, RDF, URIRef
+    SCHEMA = Namespace(SCHEMA_NS)
+    PH = Namespace(PH_NS)
+    DCT = Namespace("http://purl.org/dc/terms/")
+    PROV = Namespace("http://www.w3.org/ns/prov#")
+    PAV = Namespace("http://purl.org/pav/")
+    EXIF = Namespace("http://www.w3.org/2003/12/exif/ns#")
+    cat = _load_catalog()
+    m = URIRef(MED_NS + local)
+    is_video = (m, RDF.type, PH.MotionImage) in cat
+    is_still = (m, RDF.type, PH.StillImage) in cat
+    if not (is_video or is_still):
+        return None
+    kind = "Vídeo" if is_video else "Foto"
+
+    def person_link(p):
+        nm = _md_inline(_person_name(cat, p))
+        if str(p).startswith(PES_NS):
+            return f"[{nm}]({SITE_URL}pessoas/{str(p)[len(PES_NS):]})"
+        return nm
+
+    out = [f"# {kind} `{local}`", "",
+           f"{kind} do acervo do Pedal Hidrográfico (`med:{local}` — o hash é a "
+           "identidade da mídia; o tipo vem da classe).", ""]
+    facts = []
+    date = cat.value(m, DCT.date)
+    if date:
+        facts.append(f"- **Data:** {_md_inline(date)}")
+    geo = cat.value(m, SCHEMA.locationCreated)
+    if geo is not None:
+        lat, lng = cat.value(geo, SCHEMA.latitude), cat.value(geo, SCHEMA.longitude)
+        if lat is not None and lng is not None:
+            facts.append(f"- **Local:** {lat}, {lng} "
+                         f"([OpenStreetMap](https://www.openstreetmap.org/"
+                         f"?mlat={lat}&mlon={lng}#map=17/{lat}/{lng}))")
+    tour = cat.value(m, PH.capturedDuring)
+    if tour is not None:
+        tid = str(tour)[len(PAS_NS):] if str(tour).startswith(PAS_NS) else str(tour)
+        if (tour, RDF.type, PH.Tour) in cat:
+            facts.append(f"- **Passeio:** [{_md_inline(_tour_display_title(cat, tour))}]"
+                         f"({SITE_URL}passeio/{_tour_pretty_of(cat, tour) or tid})")
+        else:
+            facts.append(f"- **Passeio:** `{tour}`")
+    authors = sorted(person_link(p) for p in cat.objects(m, PROV.wasAttributedTo))
+    if authors:
+        facts.append(f"- **Autoria:** {', '.join(authors)}")
+    providers = sorted(person_link(p) for p in cat.objects(m, PAV.providedBy))
+    if providers:
+        facts.append(f"- **Enviado por:** {', '.join(providers)}")
+    lic = cat.value(m, DCT.license)
+    if lic:
+        facts.append(f"- **Licença:** <{lic}>")
+    lists = sorted((str(cat.value(l, SCHEMA.name) or str(l)[len(LST_NS):]), str(l))
+                   for l in cat.objects(m, SCHEMA.isPartOf))
+    if lists:
+        facts.append("- **Listas:** " + ", ".join(
+            f"[{_md_inline(nm)}]({SITE_URL}listas/{iri[len(LST_NS):]})"
+            if iri.startswith(LST_NS) else _md_inline(nm) for nm, iri in lists))
+    if is_video:
+        dur = cat.value(m, SCHEMA.duration)
+        if dur:
+            facts.append(f"- **Duração:** `{dur}`")
+        res = sorted(str(r) for r in cat.objects(m, PH.availableResolution))
+        if res:
+            facts.append(f"- **Versões:** {', '.join(res)}")
+    else:
+        focal = cat.value(m, EXIF.focalLengthIn35mmFilm)
+        if focal is not None:
+            facts.append(f"- **Distância focal (equiv. 35 mm):** {focal} mm")
+        bearing = cat.value(m, EXIF.gpsImgDirection)
+        if bearing is not None:
+            facts.append(f"- **Rumo da câmera:** {bearing}°")
+    if facts:
+        out += ["## Ficha", "", *facts, ""]
+    files = []
+    if is_video:
+        for pred, label in ((PH.video720p, "720p"), (PH.video360p, "360p"),
+                            (PH.audio, "áudio"), (SCHEMA.thumbnail, "miniatura")):
+            v = cat.value(m, pred)
+            if v:
+                files.append(f"- {label}: {SITE_URL}clips/{v}")
+    else:
+        files += [f"- grande: {SITE_URL}photos/{local}/large.jpg",
+                  f"- miniatura: {SITE_URL}photos/{local}/thumb.jpg",
+                  f"- original: `{SITE_URL}photos/{local}/original.<ext>` "
+                  "(extensão do arquivo enviado)"]
+    out += ["## Arquivos", "", *files, "",
+            "## Dados", "",
+            f"- **IRI:** `{MED_NS}{local}`",
+            f"- **RDF (Turtle):** [{SITE_URL}midia/{local}?format=ttl]"
+            f"({SITE_URL}midia/{local}?format=ttl) — ou `Accept: text/turtle` na mesma URL",
+            f"- [Na galeria]({SITE_URL}imagens.html?pick={local})", ""]
+    return "\n".join(out)
+
+
+def _html_shell_markdown(p):
+    """Markdown mínimo pra uma página do app que se compõe client-side
+    (galeria, censo, pessoas, formulários): título + descrição da própria
+    página e os ponteiros pros dados que ela consome — o que um agente
+    consegue usar, em vez de um shell HTML vazio de conteúdo."""
+    import re
+    from html import unescape
+    text = (WEB / p).read_text(encoding="utf-8")
+    m = re.search(r"<title>(.*?)</title>", text, re.S)
+    title = _md_inline(unescape(m.group(1))) if m else p
+    m = re.search(r'<meta name="description" content="([^"]*)"', text)
+    desc = unescape(m.group(1)).strip() if m else None
+    out = [f"# {title}", ""]
+    if desc:
+        out += [desc, ""]
+    out += [f"Esta página ({SITE_URL}{p}) é uma aplicação que se monta no navegador "
+            "a partir dos dados abertos do acervo; sua versão Markdown é só este "
+            "resumo. Pra ler o acervo em si:", "",
+            f"- [llms.txt]({SITE_URL}llms.txt) — guia do site pra agentes (a home em "
+            "Markdown traz o mesmo guia + os passeios recentes)",
+            f"- [data_graphs.ttl]({SITE_URL}data/data_graphs.ttl) — manifesto VoID com "
+            "todos os dumps RDF",
+            f"- [Memória Hidrográfica]({SITE_URL}memoria.html) — todos os passeios com "
+            "narrativa (também em Markdown)",
+            f"- [openapi.json]({SITE_URL}openapi.json) — descrição da API HTTP", ""]
+    return "\n".join(out)
 
 
 # ── Memória Hidrográfica (SSR da linha do tempo) ──────────────────────────
@@ -3401,18 +4234,66 @@ def _render_memoria_html():
     return html_text
 
 
+_memoria_md_cache = {"digest": None, "md": None}
+
+
+def _build_memoria_markdown():
+    """A Memória Hidrográfica em Markdown: um bloco por passeio (título
+    linkado, linha de fatos, narrativa), mais recentes primeiro — o mesmo
+    conteúdo do SSR, sem o chrome da página."""
+    tours = _tours_sorted()
+    n = len(tours)
+    out = ["# Memória Hidrográfica", "",
+           f"A linha do tempo dos passeios do Pedal Hidrográfico — {n} "
+           f"passeio{'s' if n != 1 else ''}, mais recentes primeiro. Cada título "
+           "linka pra página do passeio, que também responde em Markdown "
+           "(`Accept: text/markdown`) e Turtle (`Accept: text/turtle`).", ""]
+    for d in tours:
+        out += [f"## [{_md_inline(d['title'])}]({d['page_url']})", ""]
+        meta = _tour_md_meta_line(d)
+        if meta:
+            out += [meta, ""]
+        for para in d["paragraphs"]:
+            out += [para, ""]
+    out += [f"Mapa: <{SITE_URL}> · dados: [data_graphs.ttl]({SITE_URL}data/data_graphs.ttl)", ""]
+    return "\n".join(out)
+
+
+def _render_memoria_markdown():
+    """Markdown da Memória cacheado pelo hash do catálogo (mesma mecânica do
+    HTML SSR; build fora do _feed_lock — _tours_graph o adquire)."""
+    import hashlib
+    text = _tours_with_identities_text()
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()
+    with _feed_lock:
+        if _memoria_md_cache["digest"] == digest and _memoria_md_cache["md"]:
+            return _memoria_md_cache["md"]
+    md = _build_memoria_markdown()
+    with _feed_lock:
+        _memoria_md_cache["digest"] = digest
+        _memoria_md_cache["md"] = md
+    return md
+
+
 @app.get("/memoria.html")
 def memoria_page():
     """memoria.html com a linha do tempo pré-renderizada — best-effort:
     qualquer falha degrada pro arquivo estático (a página compõe tudo
-    client-side de qualquer jeito)."""
+    client-side de qualquer jeito). Accept: text/markdown → a linha do tempo
+    inteira em Markdown (falha degrada pro resumo genérico da página)."""
+    if _wants_markdown(request):
+        try:
+            return _markdown_response(_render_memoria_markdown())
+        except Exception:  # noqa: BLE001
+            app.logger.exception("[memoria] Markdown falhou; servindo o resumo")
+            return _markdown_response(_html_shell_markdown("memoria.html"))
     try:
         html_text = _render_memoria_html()
     except Exception:  # noqa: BLE001
         app.logger.exception("[memoria] SSR falhou; servindo o estático")
         return web_files("memoria.html")
-    return _conditional(Response(html_text, mimetype="text/html",
-                                 headers={"Cache-Control": "no-cache"}))
+    return _negotiated(Response(html_text, mimetype="text/html",
+                                headers={"Cache-Control": "no-cache"}))
 
 
 @app.get("/<path:p>")
@@ -3421,6 +4302,10 @@ def web_files(p):
     o que não é mutável. Os mutáveis (uploads, data_graphs, photos/*) têm
     handlers próprios acima e nunca caem aqui."""
     if (WEB / p).is_file():
+        # Accept: text/markdown numa página do app (galeria, censo, forms):
+        # resumo + ponteiros pros dados, em vez do shell vazio de conteúdo.
+        if p.endswith(".html") and _wants_markdown(request):
+            return _markdown_response(_html_shell_markdown(p))
         resp = send_from_directory(WEB, p)
         if p.endswith(".ttl") or p.endswith(".json"):
             resp.headers["Cache-Control"] = "no-cache"
@@ -3428,8 +4313,8 @@ def web_files(p):
     abort(404)
 
 
-# NOTA: este handler NÃO usa @serialized (ao contrário de /upload-video e do
-# Tour CRUD). O _state_lock global serializaria TAMBÉM a transferência do corpo
+# NOTA: este handler NÃO usa @serialized (nem /upload-video — mesma divisão;
+# o Tour CRUD trava a seção crítica explicitamente). O _state_lock global serializaria TAMBÉM a transferência do corpo
 # (originais de vários MB) e as gravações de blob — fazendo um lote de N fotos
 # subir estritamente em série. Aqui o trabalho é dividido por lock:
 #  - transferência do corpo (Werkzeug faz o parse do multipart no 1º acesso a
@@ -3523,6 +4408,7 @@ def upload_image():
                 upsert_image_in_uploads(ttl_text, phash, audit_block)
                 _invalidate_catalog()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
         _cleanup_orphans()
         return jsonify(
             error=f"persistência ttl: {e}", phash=phash, files=written,
@@ -3574,10 +4460,8 @@ def validate_video_ttl(ttl_text):
         ]
     # Exclui o próprio sujeito + seus nós derivados (locationCreated).
     exclude = {vid_uri} | _derived_subjects(catalog, vid_uri)
-    merged = data + v["ont"]
-    for s, p, o in catalog:
-        if s not in exclude:
-            merged.add((s, p, o))
+    own_subjects = set(data.subjects())
+    merged = _validation_universe(data, catalog, exclude, own_subjects)
     with _validate_lock:   # pyshacl não é thread-safe (parser SPARQL) — ver _validate_lock
         conforms, results_graph, _txt = v["pyshacl"].validate(
             merged, shacl_graph=v["shapes"], inference="rdfs", advanced=True)
@@ -3597,18 +4481,36 @@ def validate_video_ttl(ttl_text):
     return False, vhash, errors
 
 
+def upsert_video_in_uploads(ttl_text, vid_id):
+    """Substitui as triples do vídeo (+ nós derivados) em images.ttl pelo TTL
+    recebido; pessoas/listas novas inline vão pros catálogos delas."""
+    from rdflib import URIRef
+    Graph = _load_validator()["Graph"]
+    incoming = Graph().parse(data=ttl_text, format="turtle")
+    with _mutating("images.ttl") as catalog:
+        _purge_subject(catalog, URIRef(MED_NS + vid_id))   # vídeo + nós derivados (geo)
+        catalog += incoming
+        _route_new_persons(catalog)        # autora nova → identities.ttl
+        _route_new_collections(catalog)    # lista nova inline → lists.ttl
+
+
+# NOTA: sem @serialized, pelo mesmo motivo do /upload-image (ver a nota lá):
+# o lock global cobria a transferência do corpo (webms de vários MB) e as
+# gravações de blob, então cada clipe em voo bloqueava TODAS as outras
+# mutações pelo tempo do upload. Agora corpo + validação + blobs rodam fora do
+# lock; só o RMW do catálogo (com re-checagem TOCTOU da colisão cross-type)
+# roda sob _state_lock.
 @app.post("/upload-video")
-@serialized
 def upload_video():
     """Recebe um clipe já processado no browser:
       - `audio`     : opus dentro de webm (sempre presente, alta qualidade)
-      - `video360`  : webm 360p sem trilha de áudio (opcional, audio-only mode)
-      - `video720`  : webm 720p sem trilha de áudio (opcional, audio-only mode)
-      - `ttl`       : TTL auto-suficiente com 1 ph:Video e seus metadados
+      - `video360`  : webm 360p (opcional, audio-only mode)
+      - `video720`  : webm 720p (opcional, audio-only mode)
+      - `ttl`       : TTL auto-suficiente com 1 ph:MotionImage e seus metadados
       - `id`        : pHash de vídeo (16 hex)
-    Valida com SHACL (ph:VideoShape), persiste os arquivos em `clips/<id>.*`
-    e mescla os triples no único `data/uploads.ttl` (que serve imagens E
-    vídeos — o tipo vem da CLASSE StillImage/MotionImage, não do IRI)."""
+    Valida com SHACL (MotionImageShape), persiste os arquivos em `clips/<id>.*`
+    e mescla os triples em `data/images.ttl` (que serve imagens E vídeos — o
+    tipo vem da CLASSE StillImage/MotionImage, não do IRI)."""
     ttl_text = request.form.get("ttl")
     if not ttl_text:
         f = request.files.get("ttl")
@@ -3621,14 +4523,13 @@ def upload_video():
     if not vid_id or len(vid_id) != 16 or not all(c in "0123456789abcdef" for c in vid_id):
         return jsonify(error="id inválido (esperado vhash de 16 hex)"), 400
 
-    # Audio é obrigatório (a SHACL VideoShape exige ph:audio).
+    # Audio é obrigatório (a SHACL MotionImageShape exige ph:audio).
     audio_file = request.files.get("audio")
     if not audio_file:
         return jsonify(error="audio ausente (sempre obrigatório)"), 400
 
     # Valida antes de gravar — evita lixo em disco se o TTL não bate com a id.
-    # Wrap igual ao upload_image: um TTL malformado faz o parse de
-    # validate_video_ttl levantar, e sem isto virava 500 em vez de 400 limpo.
+    # Um TTL malformado faz o parse levantar → 400 limpo em vez de 500.
     try:
         ok, vhash, errors = validate_video_ttl(ttl_text)
     except Exception as e:  # noqa: BLE001
@@ -3640,8 +4541,8 @@ def upload_video():
     if not ok:
         return jsonify(error="SHACL violations", details=errors), 422
 
-    # Grava: audio.webm sempre; webms só se vieram (audio-only mode); thumb
-    # opcional (mas o app espera ele pra renderizar o marker como photo-style).
+    # Grava (fora do lock; keys content-addressed pelo vhash — idempotente):
+    # audio.webm sempre; webms só se vieram (audio-only mode); thumb opcional.
     written = []
     audio_key = f"clips/{vid_id}.audio.webm"
     STORE.write_bytes(audio_key, audio_file.read(), content_type="audio/webm")
@@ -3659,29 +4560,37 @@ def upload_video():
         STORE.write_bytes(key, f.read(), content_type="video/webm")
         written.append(key)
 
-    # Persiste TTL em uploads.ttl — mesma file dos uploads de imagem. Dedup
-    # por IRI (re-upload sobrescreve triples antigos do mesmo vhash).
-    try:
-        from rdflib import URIRef, Graph as RdfGraph
-        vid_iri = URIRef(MED_NS + vid_id)
-        existing_text = STORE.read_text(KEY_IMAGES) or ""
-        catalog = RdfGraph()
-        if existing_text:
-            catalog.parse(data=existing_text, format="turtle")
-        _purge_subject(catalog, vid_iri)   # vídeo + nós derivados (geo)
-        catalog.parse(data=ttl_text, format="turtle")
-        _route_new_persons(catalog)        # autora nova → identities.ttl
-        _route_new_collections(catalog)    # lista nova inline → lists.ttl
-        STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
-        _invalidate_catalog()
-    except Exception as e:  # noqa: BLE001
-        # Limpa os blobs recém-gravados (órfãos sem triples) — best-effort.
+    def _cleanup_orphans():
+        # Blobs já gravados sem triples = órfãos invisíveis. Limpa best-effort.
         for key in written:
             try:
                 STORE.delete(key)
             except Exception as e2:  # noqa: BLE001
                 print(f"[upload-video] aviso limpando órfão {key}: {e2}")
+
+    # RMW do catálogo sob o lock, com re-checagem TOCTOU da colisão cross-type
+    # (checada na validação FORA do lock — re-confere contra o catálogo ATUAL).
+    from rdflib import RDF as _RDF, URIRef as _URIRef
+    _vid_uri = _URIRef(MED_NS + vid_id)
+    _still = _URIRef(PH_NS + "StillImage")
+    collision = False
+    try:
+        with _state_lock:
+            if (_vid_uri, _RDF.type, _still) in _load_catalog():
+                collision = True
+            else:
+                upsert_video_in_uploads(ttl_text, vid_id)
+                _invalidate_catalog()
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
+        _cleanup_orphans()
         return jsonify(error=f"persistência ttl: {e}", id=vid_id, files=written), 500
+    if collision:
+        _cleanup_orphans()
+        return jsonify(
+            error=f"colisão: med:{vid_id} já existe como FOTO (ph:StillImage) — "
+                  f"vhash colidiu com um phash.", id=vid_id,
+        ), 409
 
     print(f"[upload-video] id={vid_id} files={written}")
     return jsonify(id=vid_id, files=written, ok=True)
@@ -3691,22 +4600,16 @@ def remove_video_from_uploads(vhash):
     """Lê os caminhos dos arquivos do vídeo, purga triples (vídeo + bnodes
     alcançáveis), persiste, e devolve (paths, n_triples) — pra que o caller
     delete os blobs no STORE."""
-    existing = STORE.read_text(KEY_IMAGES)
-    if not existing:
-        return [], 0
     from rdflib import URIRef
-    v = _load_validator()
     vid_iri = URIRef(MED_NS + vhash)
-    catalog = v["Graph"]()
-    catalog.parse(data=existing, format="turtle")
     SCHEMA = "https://schema.org/"
     paths = []
-    for pred in (PH_NS + "audio", PH_NS + "video360p", PH_NS + "video720p",
-                 SCHEMA + "thumbnail"):
-        for o in catalog.objects(vid_iri, URIRef(pred)):
-            paths.append(str(o))
-    n = _purge_subject(catalog, vid_iri)
-    STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
+    with _mutating("images.ttl") as catalog:
+        for pred in (PH_NS + "audio", PH_NS + "video360p", PH_NS + "video720p",
+                     SCHEMA + "thumbnail"):
+            for o in catalog.objects(vid_iri, URIRef(pred)):
+                paths.append(str(o))
+        n = _purge_subject(catalog, vid_iri)
     return paths, n
 
 
@@ -3720,6 +4623,7 @@ def delete_video(vhash):
         paths, removed_triples = remove_video_from_uploads(vhash)
         _invalidate_catalog()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
         return jsonify(error=f"persistência ttl: {e}", vhash=vhash), 500
     removed_files = 0
     for rel in paths:
@@ -3758,6 +4662,7 @@ def delete_image(phash):
         removed_triples = remove_image_from_uploads(phash)
         _invalidate_catalog()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
         return jsonify(
             error=f"persistência ttl: {e}", phash=phash, files=0,
         ), 500
@@ -3810,6 +4715,7 @@ def _do_update_media(kind, hash_):
         upsert_media_node(media_iri, result_ttl)
         _invalidate_catalog()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
         return jsonify(error=f"persistência ttl: {e}"), 500
     print(f"[update-{kind}] {hash_} remove={request.form.get('remove','')!r}")
     return jsonify(ok=True, **{("phash" if kind == "image" else "vhash"): hash_})
@@ -3870,36 +4776,35 @@ def assign_media_lists():
         if not _is_media(m):
             return jsonify(error=f"iri de mídia inválida: {m}"), 400
 
-    v = _load_validator()
-    Graph = v["Graph"]
-    catalog = Graph()
-    existing = STORE.read_text(KEY_IMAGES)
-    if existing:
-        catalog.parse(data=existing, format="turtle")
+    # Grafos vivos (sob o lock do @serialized; ver _dump_graph). Toda validação
+    # do body acontece ANTES de qualquer mutação — um 400 não pode deixar o
+    # grafo em memória diferente do persistido.
+    catalog = _dump_graph("images.ttl")
     # Listas (schema:Collection) vivem em lists.ttl — grafo à parte.
-    lists_g = Graph()
-    existing_lists = STORE.read_text(KEY_LISTS)
-    if existing_lists:
-        lists_g.parse(data=existing_lists, format="turtle")
+    lists_g = _dump_graph("lists.ttl")
 
-    # Garante que as listas novas existam como schema:Collection em lists.ttl
-    # (persistem como sujeitos à parte, iguais a pessoas em identities.ttl).
-    lists_dirty = False
+    new_by_iri = {}
     for nl in new_lists:
         li = (nl or {}).get("iri")
         nm = (nl or {}).get("name")
         if not _is_list(li) or not nm:
             return jsonify(error=f"newList inválida: {nl}"), 400
+        new_by_iri[li] = str(nm)
+    # Toda lista em `add` precisa existir como Collection (range de isPartOf)
+    # — já em lists.ttl ou declarada em newLists.
+    for li in add:
+        if (URIRef(li), RDFT, COLLECTION) not in lists_g and li not in new_by_iri:
+            return jsonify(error=f"lista inexistente (declare em newLists): {li}"), 400
+
+    # Garante que as listas novas existam como schema:Collection em lists.ttl
+    # (persistem como sujeitos à parte, iguais a pessoas em identities.ttl).
+    lists_dirty = False
+    for li, nm in new_by_iri.items():
         lu = URIRef(li)
         if (lu, RDFT, COLLECTION) not in lists_g:
             lists_g.add((lu, RDFT, COLLECTION))
-            lists_g.add((lu, NAME, Literal(str(nm))))
+            lists_g.add((lu, NAME, Literal(nm)))
             lists_dirty = True
-
-    # Toda lista em `add` precisa existir como Collection (range de isPartOf).
-    for li in add:
-        if (URIRef(li), RDFT, COLLECTION) not in lists_g:
-            return jsonify(error=f"lista inexistente (declare em newLists): {li}"), 400
 
     touched = 0
     for m in iris:
@@ -3913,8 +4818,8 @@ def assign_media_lists():
         touched += 1
 
     if lists_dirty:
-        STORE.write_text(KEY_LISTS, lists_g.serialize(format="turtle"))
-    STORE.write_text(KEY_IMAGES, catalog.serialize(format="turtle"))
+        _commit_dump("lists.ttl")
+    _commit_dump("images.ttl")
     _invalidate_catalog()
     print(f"[assign-media-lists] iris={len(iris)} touched={touched} add={add} remove={remove}")
     return jsonify(ok=True, touched=touched)
@@ -3966,10 +4871,7 @@ def update_person(slug):
     ALT_P, NAME_P, URL_P = _sc("alternateName"), _sc("name"), _sc("url")
     SEEALSO = URIRef("http://www.w3.org/2000/01/rdf-schema#seeAlso")
 
-    idg = Graph()
-    text = _load_dump_text("identities.ttl")
-    if text:
-        idg.parse(data=text, format="turtle")
+    idg = _dump_graph("identities.ttl")   # grafo vivo — sob o lock do @serialized
     defined = (any((person, RDFT, c) in idg for c in PERSON_CLS)
                or any((person, p, None) in idg for p in ALT_P))
     if not defined and (None, None, person) not in _load_catalog():
@@ -3993,7 +4895,7 @@ def update_person(slug):
         idg.add((person, SEEALSO, URIRef(u)))
     if not any((person, RDFT, c) in idg for c in PERSON_CLS):
         idg.add((person, RDFT, URIRef(SCHEMA_NS + "Person")))
-    STORE.write_text(KEY_IDENTITIES, idg.serialize(format="turtle"))
+    _commit_dump("identities.ttl")
     _invalidate_catalog()
     print(f"[update-person] {slug} alt={alt!r} name={real_name!r} "
           f"url={bool(url)} seeAlso={len(see_also)}")
@@ -4148,6 +5050,7 @@ def upload_tour():
                 try:
                     STORE.delete(key)
                 except Exception as e2:  # noqa: BLE001
+                    traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
                     print(f"[upload-tour] aviso limpando anúncio órfão de {tour_id}: {e2}")
             return jsonify(
                 error=f"persistência ttl: {e}", tour_id=tour_id,
@@ -4189,6 +5092,7 @@ def delete_tour(tour_id):
         removed_triples = remove_tour_from_tours_ttl(tour_id)
         _invalidate_catalog()
     except Exception as e:  # noqa: BLE001
+        traceback.print_exc()   # o 500 devolve só str(e); o stack só existe aqui
         return jsonify(
             error=f"persistência ttl: {e}", tour_id=tour_id,
             assets=0,
@@ -4207,6 +5111,28 @@ def delete_tour(tour_id):
           f"triples={removed_triples} routes={removed_routes}")
     return jsonify(tour_id=tour_id, assets=removed_assets,
                    triples=removed_triples, routes=removed_routes)
+
+
+# ── Aquecimento (boot) ───────────────────────────────────────────────────
+# O validador (pyshacl + shapes/ontology) e o catálogo eram carregados na
+# PRIMEIRA mutação — quem subia a primeira foto depois de um deploy/idle do
+# Cloud Run pagava imports + leitura de todos os dumps do bucket. Uma thread
+# no boot faz isso em paralelo com o primeiro request (best-effort; os locks
+# serializam se um request chegar antes). PHIDRO_NO_WARMUP=1 desliga (scripts
+# que importam este módulo só pelas funções).
+def _warm_caches():
+    import time as _time
+    t0 = _time.monotonic()
+    try:
+        _load_validator()
+        _load_catalog()
+        print(f"[warmup] validador + catálogo prontos em {_time.monotonic() - t0:.1f}s")
+    except Exception as e:  # noqa: BLE001
+        print(f"[warmup] falhou (segue lazy): {e}")
+
+
+if not os.environ.get("PHIDRO_NO_WARMUP"):
+    threading.Thread(target=_warm_caches, name="warmup", daemon=True).start()
 
 
 if __name__ == "__main__":

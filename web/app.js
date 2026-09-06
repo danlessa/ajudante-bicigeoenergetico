@@ -2596,14 +2596,19 @@ async function loadAllGraphs() {
     let m;
     try { m = await fetchManifest(b.base, b.label); }
     catch (e) { lastErr = e.message; continue; }
-    // Manifesto vivo — baixa cada arquivo listado.
+    // Manifesto vivo — baixa TODOS os arquivos listados em PARALELO (eram N
+    // round trips em série, cada um um request no Cloud Run: ~0,25 s a mais
+    // por carga/reload em produção) e parseia na ordem do manifesto.
     const allQuads = [];
     const parts    = [];
-    for (const u of m.urls) {
+    const texts = await Promise.all(m.urls.map((u) =>
+      fetch(u, { cache: 'no-cache' })
+        .then((r) => { if (!r.ok) { console.warn(`[manifest] ${u}: ${r.status}`); return null; } return r.text(); })
+        .catch((e) => { console.warn(`[manifest] ${u}: ${e.message}`); return null; })));
+    for (const [i, t] of texts.entries()) {
+      if (t == null) continue;
+      const u = m.urls[i];
       try {
-        const r = await fetch(u, { cache: 'no-cache' });
-        if (!r.ok) { console.warn(`[manifest] ${u}: ${r.status}`); continue; }
-        const t = await r.text();
         parts.push(`# ─── ${u} ───\n${t}`);
         allQuads.push(...await parseTtlToQuads(t));
       } catch (e) { console.warn(`[manifest] ${u}: ${e.message}`); }
@@ -3643,6 +3648,7 @@ function renderUploadChip() {
 const uploadBtn        = document.getElementById('upload-btn');
 const uploadModal      = document.getElementById('upload-modal');
 const uploadIframe     = document.getElementById('upload-iframe');
+let _uploadDirty = false;   // o form avisou (phidro-media-changed) que salvou/editou algo
 function openUploadModal() {
   if (!uploadModal) return;
   closeOtherMobileDialogs('upload');
@@ -3663,8 +3669,10 @@ function closeUploadModal() {
   try {
     uploadIframe?.contentWindow?.postMessage({ type: 'phidro-upload-modal-closed' }, window.location.origin);
   } catch (_) {}
-  // Pega o manifesto + tiles novos sem dance de hard-refresh.
-  reloadPhotos();
+  // Recarrega o catálogo SÓ se o form avisou que salvou algo
+  // (phidro-media-changed): fechar sem enviar não custa mais 4 dumps + um
+  // rebuild de todos os marcadores.
+  if (_uploadDirty) { _uploadDirty = false; reloadPhotos(); }
 }
 uploadBtn?.addEventListener('click', openUploadModal);
 // Clique no overlay (fora do conteúdo) fecha.
@@ -3680,6 +3688,7 @@ document.addEventListener('keydown', (e) => {
 // porque o ?id pode mudar entre invocações (novo vs editar X vs editar Y).
 const tourModal      = document.getElementById('tour-modal');
 const tourIframe     = document.getElementById('tour-iframe');
+let _tourDirty = false;     // o form avisou (phidro-tour-changed) que salvou/apagou um passeio
 function openTourModal(tourId) {
   if (!tourModal) return;
   closeOtherMobileDialogs('tour');
@@ -3698,10 +3707,11 @@ function closeTourModal() {
   if (tourModal) tourModal.hidden = true;
   // Libera o iframe (e seu state) — próxima abertura monta limpo.
   if (tourIframe) tourIframe.src = '';
-  // Tour pode ter sido criado/editado/deletado → recarrega catálogos.
-  // O resumo no route-modal re-fetch'a tours.ttl com no-cache na próxima
-  // abertura, então mudanças aparecem sem refresh.
-  reloadPhotos();
+  // Tour criado/editado/deletado (o form avisa via phidro-tour-changed) →
+  // recarrega catálogos; fechar sem salvar não recarrega nada. O resumo no
+  // route-modal re-fetch'a tours.ttl com no-cache na próxima abertura, então
+  // mudanças aparecem sem refresh.
+  if (_tourDirty) { _tourDirty = false; reloadPhotos(); }
 }
 tourModal?.addEventListener('click', (e) => {
   if (e.target === tourModal) closeTourModal();
@@ -3764,6 +3774,8 @@ window.addEventListener('message', (e) => {
       loadClipsCatalog().then((clips) => makeClipMarkers(clips));
       break;
     case 'phidro-gallery-show':   galleryShowMedia(e.data.iri); break;
+    case 'phidro-media-changed':  _uploadDirty = true; break;   // form de upload salvou/editou
+    case 'phidro-tour-changed':   _tourDirty = true; break;     // form de passeio salvou/apagou
     default: break;
   }
 });

@@ -77,10 +77,12 @@
     width: 8px; height: 8px; border-radius: 50%; background: var(--muted);
     border: 2px solid var(--bg); }
   li.tm:target { border-color: var(--accent); }
-  .edit-btn { position: absolute; top: 12px; right: 14px; color: var(--accent);
+  /* Ações do card (Editar / Subir imagens), ancoradas no topo-direita. */
+  .tm-actions { position: absolute; top: 12px; right: 14px; z-index: 1;
+    display: flex; gap: 6px; }
+  .edit-btn { color: var(--accent);
     background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
-    padding: 3px 9px; font-size: 12px; font-weight: 600; text-decoration: none;
-    z-index: 1; }
+    padding: 3px 9px; font-size: 12px; font-weight: 600; text-decoration: none; }
   .edit-btn:hover { border-color: var(--accent); }
 
   /* Grid do TourMemory — compacto: a galeria vai pra coluna que tem espaço
@@ -180,7 +182,7 @@
   @media print {
     :root { --bg: #fff; --panel: #fff; --muted: #333; --border: #999; }
     body { padding: 0; }
-    header nav, .toolbar, .edit-btn, footer { display: none !important; }
+    header nav, .toolbar, .tm-actions, footer { display: none !important; }
     ol.linha { padding-left: 0; }
     ol.linha::before, li.ano::before, li.tm::before { display: none; }
     li.tm { border: none; border-top: 2px solid #000; border-radius: 0;
@@ -275,13 +277,12 @@ async function loadQuads() {
     urls = ['./data/tours.ttl', './data/images.ttl']
       .map((u) => new URL(u, location.href).href);
   }
-  const parts = [];
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { cache: 'no-cache' });
-      if (r.ok) parts.push(await r.text());
-    } catch (err) { console.warn(`[memória] ${u}: ${err.message}`); }
-  }
+  // Em PARALELO (eram N round trips em série), concatenados na ordem.
+  const parts = (await Promise.all(urls.map((u) =>
+    fetch(u, { cache: 'no-cache' })
+      .then((r) => (r.ok ? r.text() : null))
+      .catch((err) => { console.warn(`[memória] ${u}: ${err.message}`); return null; })
+  ))).filter((t) => t != null);
   return new N3.Parser().parse(parts.join('\n\n'));
 }
 
@@ -491,8 +492,12 @@ function tourMemoryHtml(t, medias) {
       `<div class="g-tiles">${tiles}</div></details>` +
       `<div class="g-tiles g-tiles-mais"></div>`
     : '';
-  const editar = `<a class="edit-btn" href="./upload_tour.html?id=${encodeURIComponent(t.slug)}"` +
-    ` title="Editar este passeio em upload_tour.html">Editar</a>`;
+  const editar = `<div class="tm-actions">` +
+    `<a class="edit-btn" href="./upload_tour.html?id=${encodeURIComponent(t.slug)}"` +
+    ` title="Editar este passeio em upload_tour.html">Editar</a>` +
+    `<a class="edit-btn" href="./upload_images.html?tour=${encodeURIComponent(t.slug)}"` +
+    ` title="Enviar fotos e vídeos deste passeio (upload_images.html já abre com ele selecionado)">Subir imagens</a>` +
+    `</div>`;
   return (
     `<li class="tm" id="${escapeHtml(t.slug)}">${editar}` +
       `<div class="tm-grid${arte ? '' : ' sem-arte'}" data-gal="${galState}" data-np="${nP}" data-n="${medias.length}">` +

@@ -1,0 +1,200 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "amora — API HTTP do Pedal Hidrográfico",
+    "version": "2026-09-04",
+    "summary": "Leitura do acervo do Pedal Hidrográfico (passeios, pessoas, mídias, séries, listas) e dos dumps RDF, com content negotiation HTML | Markdown | Turtle nas mesmas URLs.",
+    "description": "amora é o mapa-PWA do Pedal Hidrográfico, coletivo de ciclismo urbano da Grande São Paulo. Este documento descreve a API HTTP de LEITURA que o backend Flask expõe — é o que um agente precisa. Convenções:\n\n- **Content negotiation** nas páginas de recurso: `Accept: text/markdown` devolve a página em Markdown limpo (com `x-markdown-tokens` e `Content-Signal`); `Accept: text/turtle` devolve as triples RDF do recurso; qualquer outro Accept (`*/*`, `text/html`) devolve HTML. `?format=md|ttl|html` força a representação.\n- **IRIs dereferenciáveis**: as coisas moram em `https://id.pedalhidrografi.co/<tipo>/<slug>`; a Cloudflare faz 303 (preservando o path) pra este host, onde os handlers `/passeio`, `/pessoas`, `/serie`, `/midia`, `/listas`, `/terms` respondem.\n- **Dados abertos**: os catálogos inteiros estão em `/data/*.ttl` (manifesto VoID em `/data/data_graphs.ttl`); mídia em geral CC BY-SA 4.0 (cada item carrega sua licença).\n- Os endpoints de escrita (upload/edição/exclusão) existem, sem autenticação por desenho (acesso confiável), mas são das ferramentas do próprio coletivo e ficam fora deste documento.\n- Servidores: a instância pública em `https://amora.pedalhidrografi.co`; o mesmo backend roda self-hosted em qualquer origem (`servers[1]`).",
+    "contact": {"name": "Pedal Hidrográfico", "url": "https://pedalhidrografi.co/"},
+    "license": {"name": "CC BY-SA 4.0 (dados do acervo)", "url": "https://creativecommons.org/licenses/by-sa/4.0/"}
+  },
+  "externalDocs": {"description": "llms.txt — guia do site pra agentes", "url": "https://amora.pedalhidrografi.co/llms.txt"},
+  "servers": [
+    {"url": "https://amora.pedalhidrografi.co", "description": "Instância pública (Cloud Run atrás da Cloudflare)"},
+    {"url": "/", "description": "Mesma origem — self-hosted / local"}
+  ],
+  "tags": [
+    {"name": "páginas", "description": "Páginas do site (HTML por padrão; Markdown com Accept: text/markdown)."},
+    {"name": "recursos", "description": "Coisas com IRI dereferenciável (HTML | Markdown | Turtle)."},
+    {"name": "dados", "description": "Dumps RDF, geometria das rotas e feeds."},
+    {"name": "rotas salvas", "description": "Biblioteca de traçados do editor de rotas."},
+    {"name": "descoberta", "description": "Catálogo de APIs, OpenAPI, llms.txt, saúde."}
+  ],
+  "paths": {
+    "/": {
+      "get": {
+        "tags": ["páginas"],
+        "summary": "Home — o mapa (HTML) ou o guia do site + passeios recentes (Markdown)",
+        "description": "HTML: o shell do app (mapa Leaflet). Markdown: o conteúdo de `/llms.txt` seguido da lista dos passeios mais recentes, cada um linkando pra sua página. `?tour=<slug>` (deep link antigo) responde 303 pra `/passeio/<slug>`. A resposta traz o `Link` de descoberta (RFC 9727).",
+        "parameters": [{"$ref": "#/components/parameters/format"}, {"name": "tour", "in": "query", "description": "Deep link legado: slug (legível ou slug8) ou id numérico antigo de um passeio → 303 pra /passeio/<slug>.", "schema": {"type": "string"}}],
+        "responses": {"200": {"$ref": "#/components/responses/HtmlOrMarkdown"}, "303": {"description": "Deep link `?tour=` → página canônica do passeio."}}
+      }
+    },
+    "/passeio/{slug}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Um passeio (ph:Tour)",
+        "description": "Aceita o slug legível (`schema:identifier`, mintado do título) ou o slug8 (identidade; 303 pro legível quando existe); id numérico legado → 303. HTML: o app pré-renderizado com `<article>` + JSON-LD NewsArticle. Markdown: título, data, arte do chamado, narrativa, ficha (série/edição, energias estimada e medida em kJ, saída → chegada, tempo em movimento, participantes, rota, Instagram, elaboradores) e ponteiros pros dados. Turtle: as triples do passeio fatiadas de `tours.ttl` (sujeito `https://id.pedalhidrografi.co/passeio/<slug8>`).",
+        "parameters": [{"$ref": "#/components/parameters/slug"}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/Negotiated"}, "303": {"description": "Forma não canônica (slug8 com legível disponível, id legado) → URL canônica."}, "404": {"description": "Passeio desconhecido (Markdown/Turtle). Em HTML, um passeio desconhecido degrada pro app com aviso."}}
+      }
+    },
+    "/passeio/{serie}/{seq}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Uma edição de série (ph:SeriesEdition), ex.: /passeio/PH/96",
+        "description": "Turtle: as triples da edição + a aresta do passeio que a realiza. HTML/Markdown: 303 pro passeio realizador.",
+        "parameters": [{"name": "serie", "in": "path", "required": true, "description": "Código da série (PH, BT, BP, S, SESC).", "schema": {"type": "string"}}, {"name": "seq", "in": "path", "required": true, "description": "Número da edição (uma colisão histórica vira edição distinta, ex.: 3-5).", "schema": {"type": "string"}}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"description": "Turtle da edição.", "content": {"text/turtle": {"schema": {"type": "string"}}}}, "303": {"description": "→ /passeio/<slug> do passeio realizador."}, "404": {"description": "Edição desconhecida."}}
+      }
+    },
+    "/serie/{serie}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Uma série de eventos (schema:EventSeries) e suas edições",
+        "description": "HTML/Markdown: lista das edições (mais recentes primeiro), cada uma linkando pro passeio. Turtle: a série + edições + passeios realizadores.",
+        "parameters": [{"name": "serie", "in": "path", "required": true, "schema": {"type": "string"}}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/Negotiated"}, "404": {"description": "Série desconhecida."}}
+      }
+    },
+    "/pessoas/{slug}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Uma pessoa (schema:Person)",
+        "description": "HTML: a página de pessoas focada no slug. Markdown: nome, apelido, links, passeios elaborados e contagem de mídias assinadas. Turtle: as triples da pessoa (identities.ttl).",
+        "parameters": [{"$ref": "#/components/parameters/slug"}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/Negotiated"}, "404": {"description": "Pessoa desconhecida (Markdown/Turtle)."}}
+      }
+    },
+    "/midia/{hash}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Uma foto (ph:StillImage) ou vídeo (ph:MotionImage)",
+        "description": "O hash perceptual (16 hex) é a identidade; o tipo vem da classe. Markdown: ficha (data, local, passeio, autoria, licença, listas, arquivos). Turtle: as triples da mídia (images.ttl). HTML: 303 pra galeria com a mídia selecionada. A forma legada `image_<hash>` / `video_<hash>` ainda resolve.",
+        "parameters": [{"name": "hash", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^(image_|video_)?[0-9a-f]{16}$"}}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/MarkdownOrTurtle"}, "303": {"description": "HTML → /imagens.html?pick=<hash>."}, "404": {"description": "Mídia desconhecida."}}
+      }
+    },
+    "/listas/{slug}": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "Uma lista/álbum (schema:Collection)",
+        "description": "Markdown: nome + membros (cada mídia com link e passeio). Turtle: a Collection + `schema:hasPart` calculado. HTML: 303 pra galeria filtrada pela lista.",
+        "parameters": [{"$ref": "#/components/parameters/slug"}, {"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/MarkdownOrTurtle"}, "303": {"description": "HTML → /imagens.html?list=<slug>."}, "404": {"description": "Lista desconhecida."}}
+      }
+    },
+    "/terms": {
+      "get": {
+        "tags": ["recursos"],
+        "summary": "O vocabulário ph: (namespace https://id.pedalhidrografi.co/terms#)",
+        "description": "HTML/Markdown: classes e propriedades com label, comentário e metadados. Turtle: `ontology.ttl` inteiro. O fragmento (`#StillImage`) é resolvido pelo cliente contra o documento.",
+        "parameters": [{"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/Negotiated"}}
+      }
+    },
+    "/memoria.html": {
+      "get": {
+        "tags": ["páginas"],
+        "summary": "Memória Hidrográfica — a linha do tempo de todos os passeios",
+        "description": "HTML: a página com a linha do tempo pré-renderizada. Markdown: todos os passeios (título linkado, fatos, narrativa), mais recentes primeiro.",
+        "parameters": [{"$ref": "#/components/parameters/format"}],
+        "responses": {"200": {"$ref": "#/components/responses/HtmlOrMarkdown"}}
+      }
+    },
+    "/data/{filename}": {
+      "get": {
+        "tags": ["dados"],
+        "summary": "Dumps RDF (Turtle) — o acervo inteiro",
+        "description": "`data_graphs.ttl` é o manifesto VoID (ponto de entrada; lista os dumps via `void:dataDump`). `tours.ttl` = passeios, séries e edições; `images.ttl` = fotos e vídeos; `identities.ttl` = pessoas; `lists.ttl` = listas/álbuns; `ontology.ttl` = vocabulário; `shapes.ttl` = SHACL. Respostas com ETag (revalidação barata) e `X-Robots-Tag: noindex`.",
+        "parameters": [{"name": "filename", "in": "path", "required": true, "schema": {"type": "string", "enum": ["data_graphs.ttl", "tours.ttl", "images.ttl", "identities.ttl", "lists.ttl", "ontology.ttl", "shapes.ttl"]}}],
+        "responses": {"200": {"description": "Turtle.", "content": {"text/turtle": {"schema": {"type": "string"}}}}, "404": {"description": "Arquivo desconhecido."}}
+      }
+    },
+    "/routes.json": {
+      "get": {
+        "tags": ["dados"],
+        "summary": "Geometria das rotas dos passeios (polylines lat/lng + POIs), pré-processada pro mapa",
+        "responses": {"200": {"description": "Objeto com uma entrada por passeio com rota, chaveada por `tourIri`.", "content": {"application/json": {"schema": {"type": "object"}}}}}
+      }
+    },
+    "/feed.xml": {
+      "get": {"tags": ["dados"], "summary": "RSS 2.0 dos passeios (mais recentes primeiro)", "responses": {"200": {"description": "RSS.", "content": {"application/rss+xml": {"schema": {"type": "string"}}}}}}
+    },
+    "/sitemap.xml": {
+      "get": {"tags": ["dados"], "summary": "Sitemap dinâmico (home + /passeio/<slug> por passeio)", "responses": {"200": {"description": "Sitemap XML.", "content": {"application/xml": {"schema": {"type": "string"}}}}}}
+    },
+    "/saved-routes": {
+      "get": {
+        "tags": ["rotas salvas"],
+        "summary": "Lista das rotas salvas no editor de traçado (mais novas primeiro)",
+        "responses": {"200": {"description": "`{routes: [{id, name, slug, created, updated, points, stats, preview, distMeters}]}`.", "content": {"application/json": {"schema": {"type": "object", "properties": {"routes": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "name": {"type": "string"}, "slug": {"type": "string"}, "created": {"type": ["string", "null"]}, "updated": {"type": ["string", "null"]}, "points": {"type": ["integer", "null"]}, "stats": {"type": ["object", "null"]}, "preview": {"type": ["array", "null"]}, "distMeters": {"type": ["number", "null"]}}}}}}}}}}
+      }
+    },
+    "/saved-route/{ref}": {
+      "get": {
+        "tags": ["rotas salvas"],
+        "summary": "Estado completo de uma rota salva (formato de compartilhamento do editor)",
+        "parameters": [{"name": "ref", "in": "path", "required": true, "description": "id hex OU slug do nome.", "schema": {"type": "string"}}],
+        "responses": {"200": {"description": "Estado da rota + `id`/`slug`.", "content": {"application/json": {"schema": {"type": "object"}}}}, "404": {"description": "Rota desconhecida."}}
+      }
+    },
+    "/route/{slug}": {
+      "get": {
+        "tags": ["rotas salvas"],
+        "summary": "Link compartilhável de uma rota salva (página com OG tags → redireciona pro editor)",
+        "parameters": [{"$ref": "#/components/parameters/slug"}],
+        "responses": {"200": {"description": "HTML mínimo com OG tags (og:image = /route/<slug>/og.png) e redirecionamento pra `/#rt=<slug>`.", "content": {"text/html": {"schema": {"type": "string"}}}}, "303": {"description": "Slug desconhecido → app com aviso."}}
+      }
+    },
+    "/live-locations": {
+      "get": {
+        "tags": ["dados"],
+        "summary": "Posições ao vivo (opt-in, pseudônimas, efêmeras) + rastro de cada pessoa",
+        "description": "Estado em memória, janela de 3 h, `Cache-Control: no-store`. `{positions: [{id, name, lat, lng, ts, age, accuracy?, heading?, trail: [[lat, lng, accuracy|null, ageSeconds], …]}]}`.",
+        "responses": {"200": {"description": "Posições.", "content": {"application/json": {"schema": {"type": "object", "properties": {"positions": {"type": "array", "items": {"type": "object"}}}}}}}}
+      }
+    },
+    "/health": {
+      "get": {"tags": ["descoberta"], "summary": "Saúde do serviço", "responses": {"200": {"description": "`ok`."}}}
+    },
+    "/llms.txt": {
+      "get": {"tags": ["descoberta"], "summary": "Guia do site pra agentes (llmstxt.org) — Markdown servido como texto", "responses": {"200": {"description": "Markdown.", "content": {"text/plain": {"schema": {"type": "string"}}}}}}
+    },
+    "/.well-known/api-catalog": {
+      "get": {"tags": ["descoberta"], "summary": "Catálogo de APIs (RFC 9727) — linkset JSON (RFC 9264)", "responses": {"200": {"description": "Linkset com uma entrada por API publicada (amora HTTP; Linked Data em id.pedalhidrografi.co).", "content": {"application/linkset+json": {"schema": {"type": "object", "properties": {"linkset": {"type": "array", "items": {"type": "object"}}}}}}}}}
+    },
+    "/openapi.json": {
+      "get": {"tags": ["descoberta"], "summary": "Este documento", "responses": {"200": {"description": "OpenAPI 3.1.", "content": {"application/json": {"schema": {"type": "object"}}}}}}
+    }
+  },
+  "components": {
+    "parameters": {
+      "slug": {"name": "slug", "in": "path", "required": true, "description": "Slug do recurso (Crockford base32 de 8 chars, ou o slug legível no caso de passeios).", "schema": {"type": "string"}},
+      "format": {"name": "format", "in": "query", "required": false, "description": "Força a representação, sobrepondo o Accept: `md`/`markdown` (Markdown), `ttl`/`turtle`/`rdf` (Turtle), `html`/`web` (HTML).", "schema": {"type": "string", "enum": ["md", "markdown", "ttl", "turtle", "rdf", "html", "web"]}}
+    },
+    "headers": {
+      "Vary": {"description": "`Accept` — a URL tem mais de uma representação.", "schema": {"type": "string"}},
+      "Link": {"description": "Links de descoberta (RFC 8288/9727): `api-catalog`, `service-desc`, `service-doc`, `describedby`, `alternate` (RSS).", "schema": {"type": "string"}},
+      "x-markdown-tokens": {"description": "Estimativa do número de tokens do corpo Markdown (~4 caracteres por token).", "schema": {"type": "integer"}},
+      "Content-Signal": {"description": "Sinal de política de uso do conteúdo (contentsignals.org), ex.: `ai-train=yes, search=yes, ai-input=yes`.", "schema": {"type": "string"}}
+    },
+    "responses": {
+      "Negotiated": {
+        "description": "A representação escolhida pelo Accept (ou `?format=`): HTML (default), Markdown ou Turtle.",
+        "headers": {"Vary": {"$ref": "#/components/headers/Vary"}, "Link": {"$ref": "#/components/headers/Link"}, "x-markdown-tokens": {"$ref": "#/components/headers/x-markdown-tokens"}, "Content-Signal": {"$ref": "#/components/headers/Content-Signal"}},
+        "content": {"text/html": {"schema": {"type": "string"}}, "text/markdown": {"schema": {"type": "string"}}, "text/turtle": {"schema": {"type": "string"}}}
+      },
+      "HtmlOrMarkdown": {
+        "description": "HTML (default) ou Markdown (`Accept: text/markdown` / `?format=md`).",
+        "headers": {"Link": {"$ref": "#/components/headers/Link"}, "x-markdown-tokens": {"$ref": "#/components/headers/x-markdown-tokens"}, "Content-Signal": {"$ref": "#/components/headers/Content-Signal"}},
+        "content": {"text/html": {"schema": {"type": "string"}}, "text/markdown": {"schema": {"type": "string"}}}
+      },
+      "MarkdownOrTurtle": {
+        "description": "Markdown (`Accept: text/markdown`) ou Turtle (`Accept: text/turtle`); HTML redireciona (303) pra galeria.",
+        "headers": {"Vary": {"$ref": "#/components/headers/Vary"}, "Link": {"$ref": "#/components/headers/Link"}, "x-markdown-tokens": {"$ref": "#/components/headers/x-markdown-tokens"}, "Content-Signal": {"$ref": "#/components/headers/Content-Signal"}},
+        "content": {"text/markdown": {"schema": {"type": "string"}}, "text/turtle": {"schema": {"type": "string"}}}
+      }
+    }
+  }
+}

@@ -442,17 +442,15 @@ async function loadTours() {
   // tours.ttl (passeios/séries) + identities.ttl (nomes das pessoas — desde o
   // split, alternateName vive lá, não mais em tours.ttl). Parseados juntos pro
   // mapa `labels` resolver tanto séries quanto participantes/iniciantes.
-  const parts = [];
-  for (const url of ['./data/tours.ttl', './data/identities.ttl']) {
-    const r = await fetch(url, { cache: 'no-cache' });
-    if (!r.ok) {
-      if (url.includes('tours')) throw new Error(`tours.ttl HTTP ${r.status}`);
-      continue;   // identities.ttl ausente (host estático) — nomes caem pro slug
-    }
-    parts.push(await r.text());
-  }
+  // tours + identities em PARALELO, com o N3 carregando junto (era tudo em série).
+  const n3P = loadN3();
+  const [rt, ri] = await Promise.all(['./data/tours.ttl', './data/identities.ttl']
+    .map((url) => fetch(url, { cache: 'no-cache' })));
+  if (!rt.ok) throw new Error(`tours.ttl HTTP ${rt.status}`);
+  const parts = [await rt.text()];
+  if (ri.ok) parts.push(await ri.text());   // identities.ttl ausente (host estático) — nomes caem pro slug
   const text = parts.join('\n\n');
-  const N3 = await loadN3();
+  const N3 = await n3P;
   const parser = new N3.Parser({ format: 'text/turtle' });
   return new Promise((resolve, reject) => {
     // Acumula por subject, depois cruza com bnodes (energyEstimate, assoc).

@@ -33,7 +33,10 @@ one optional hosted deploy target, not a dependency.
   `tom-select.min.css`, `qrcode.js`, `leaflet/` (js+css+images),
   `locatecontrol/` — Leaflet & friends were vendored off unpkg/jsdelivr;
   only app.js's lazy loads (exifr/heic2any/jszip/geotiff) still hit
-  jsdelivr). Leaflet-based map. Also hosts `upload_images.html` (per-photo upload
+  jsdelivr; `upload_images.html`/`upload_tour.html` load N3 from the
+  vendored `lib/n3.min.js` too — `upload_images.html`'s only remaining CDN
+  import is heic2any, prefetched WITHOUT blocking the boot and memoized by
+  promise). Leaflet-based map. Also hosts `upload_images.html` (per-photo upload
   form), `upload_tour.html` (per-tour upsert form),
   `backfill_tours.html` (mass-backfill applet for missing tour fields),
   `censo.html` (aggregated tour metrics + roster, opened as a modal
@@ -69,8 +72,10 @@ one optional hosted deploy target, not a dependency.
   form — superseded in production by `web/upload_images.html`). The
   active SHACL `shapes.ttl` and `ontology.ttl` live alongside the data
   in `web/data/`; the backend lazily loads them (bucket-first, container
-  copy as fallback) on first validation, not at startup — see
-  `_load_validator` in `backend/main.py`. The former top-level `ontology/`
+  copy as fallback) on first validation — a warm-up thread at boot
+  (`_warm_caches`, opt-out `PHIDRO_NO_WARMUP=1`) does it in parallel with the
+  first request so nobody pays imports + catalog parse on the first upload —
+  see `_load_validator` in `backend/main.py`. The former top-level `ontology/`
   dir (v1.1 `pedalhidrografico.ttl` +
   JSON-LD context) was removed — git history is the only reference.
 - `scripts/` — `build-routes.py` (**full rebuild** of `routes.json` from
@@ -180,6 +185,10 @@ one optional hosted deploy target, not a dependency.
   `ingest-drive.py` (fase 1 da ingestão do acervo: só os originais com EXIF/GPS),
   `migrate-captura-fixes.py` (reparos de catálogo: arte em host local, datatype
   de `ph:sequenceInSeries`),
+  `migrate-date-offsets.py` (one-shot: repara os offsets UTC das
+  `dcterms:date` de mídia que o bug do owlrl deslocou — ver Conventions;
+  textual, dry-run por default, `--apply` grava; round-trip pull → script →
+  `deploy-cloudrun.sh --state-only` → `POST /reload`),
   `gen-synthetic-rdf.py`, `mock_location.sh` (empurra posições de
   teste da localização ao vivo pro backend — random walk, 1 ponto/3 s; bate no
   remoto amora por padrão, `--local` p/ 127.0.0.1:8080; curl não precisa de
@@ -264,6 +273,36 @@ defesa. Guid do feed emite o IRI legado `phd:tour_<numid>` pra passeios migrados
 (RSS estável). Resolvers path-based não sofrem com o strip de query (só `?query=`
 era afetado; paths sempre chegam). **Só `amora.pedalhidrografi.co/?query=` era
 afetado — os IRIs `id.…/<path>` sempre preservam.**
+
+**Markdown pra agentes (3ª representação) + descoberta.** Toda página HTML
+negocia também Markdown: `Accept: text/markdown` (ou `?format=md`) devolve a
+mesma URL em Markdown limpo. `_negotiated_format()` é o ÚNICO negociador
+(`ttl`|`md`|`html`; `_wants_turtle`/`_wants_markdown` são atalhos) e
+`_markdown_response()` monta a resposta (`text/markdown`, `x-markdown-tokens`
+estimado a ~4 chars/token, `Content-Signal` — env `CONTENT_SIGNAL`, default
+igual ao do "Markdown for Agents" da Cloudflare, vazio desliga — e
+`Vary: Accept`). Renderers: home = `llms.txt` + passeios recentes
+(`_render_home_markdown`); passeio (`_render_tour_markdown`, fatos via
+`_tour_facts`, compartilhados com o SSR HTML); Memória
+(`_build_memoria_markdown`, cache por digest como o HTML); série
+(`_series_rows` alimenta HTML e MD), pessoa, mídia, lista (os três leem o
+`_load_catalog()` cacheado), `/terms` (`_terms_model` alimenta HTML e MD);
+qualquer outro `.html` estático vira um resumo — título + descrição +
+ponteiros pros dados (`_html_shell_markdown`). HTML segue o default: `*/*` e
+`text/html` caem nele; só um Accept que PREFERE markdown/turtle sai dele.
+**`Vary: Accept` só vai em resposta GERADA** (`_negotiated()`), nunca nos
+estáticos que o SW pré-cacheia (index/pessoas/imagens.html): o Cache API
+compara o Accept do request guardado (addAll por string, sem Accept) com o de
+navegação, e o shell offline pararia de casar. Descoberta (RFC 8288/9727): o
+`after_request _discovery_links` põe um `Link` em toda resposta 200
+HTML/Markdown — `api-catalog` → `/.well-known/api-catalog` (linkset JSON
+gerado, `api_catalog()`), `service-desc` → `web/openapi.json` (**mantido à
+mão** — atualizar quando um endpoint de leitura mudar), `service-doc` →
+`llms.txt`, `describedby` → o manifesto VoID, `alternate` → o feed. Gotcha
+Cloudflare: se uma cache rule cachear o HTML de `/` ignorando o Accept, um
+agente pode receber o HTML cacheado — ou bypassar o cache pra
+`Accept: text/markdown`, ou ligar o "Markdown for Agents" da zona (coexiste:
+a CF só converte HTML e passa o `text/markdown` da origem intacto).
 
 ## Architecture
 
@@ -400,7 +439,18 @@ Key flows:
   `ph:rwgps a schema:Organization`) to `sh:class` checks, so manual
   merging is mandatory. See `docs/DESIGN.md` §2 for the
   full gotcha. `validate_image_ttl` and `validate_video_ttl` are siblings
-  that each pin to their target class + IRI prefix.
+  that each pin to their target class + IRI prefix. **The validation
+  universe is scoped** (`_validation_universe`): fragment + ontology + only
+  the `rdf:type` triples of the nodes the fragment references (what the
+  shapes' `sh:class` checks need) — plus, for tours, the incoming
+  `ph:inSeriesEdition` edges from OTHER tours (the SeriesEditionShape's
+  "exactly one tour per edition" inverse-path count). Merging the whole
+  catalog (~14k triples) cost ~1.3–1.6 s of rdfs closure + SHACL per save
+  under `_validate_lock` — i.e. it serialized every upload; the scoped
+  universe takes ~30 ms with byte-identical verdicts (violations AND
+  warnings, parity-checked over every tour/video and 60 photos). If a shape
+  ever needs OTHER catalog context (a new inverse path, a `sh:sparql`),
+  extend `_validation_universe` — don't go back to merging the catalog.
 - **Clips / Animação.** The "Animação" topbar button toggles both the
   marker spotlight pulse AND a ghost-video overlay (translucent `<video>`
   over the map). The app reads `ph:Video` entries from `uploads.ttl` via
@@ -518,7 +568,8 @@ Key flows:
   mais novas primeiro), `GET /saved-route/<id|slug>` (estado completo, formato
   de compartilhamento, + `id`/`slug` da rota), `POST /save-route` (upsert;
   body `{name, state, id?}`; o NOME é obrigatório e ÚNICO — vira o slug do
-  link; colisão com outra rota → 409), `POST /delete-route/<id>`. Cada rota
+  link; colisão com outra rota → 409; responde logo depois do JSON write +
+  resync dos tours — o card OG renderiza em THREAD), `POST /delete-route/<id>`. Cada rota
   salva tem um **link compartilhável POR NOME** `/route/<slug>` —
   `GET /route/<slug>` serve uma página mínima com as OG tags da rota
   (og:image = `/route/<slug>/og.png` — o card de WhatsApp/redes: traçado
@@ -527,10 +578,14 @@ Key flows:
   `flatgeobuf` em storage.googleapis.com — a Cloudflare 403a UAs não-browser)
   + logo no canto superior direito + **badge de kJ/intensidade** (faixas do
   censo, fonte woff2 do repo convertida via fontTools) no inferior direito.
-  O card é **PRÉ-RENDERIZADO no /save-route** (fora do lock — save_route não
-  usa @serialized de propósito, só o miolo read-modify-write trava) e
+  O card é **pré-renderizado numa THREAD disparada pelo /save-route DEPOIS
+  da resposta** (`_refresh_route_og_async` — FGB + Pillow levam ~2 s e o
+  usuário esperava isso tudo pra ver o link/QR; save_route não usa
+  @serialized de propósito, só o miolo read-modify-write trava) e
   persistido em `route_og/<id>.png` no store; o GET cai em memória → blob →
-  render lazy (rotas pré-feature); delete-route apaga o blob; max-age 1 h)
+  render lazy (rede de segurança: no Cloud Run a CPU fora de request é
+  throttled e a thread pode atrasar; `_og_render_lock` evita render duplo);
+  delete-route apaga o blob; max-age 1 h)
   e redireciona o humano na hora
   (script + meta-refresh) pra `/#rt=<slug>` (FRAGMENTO, como o `#st=`:
   nunca é comido pelo strip de query da Cloudflare nem pelo cache do SW —
@@ -563,8 +618,11 @@ Key flows:
   (`_LIVE_CORS_ORIGINS` = `capacitor://` / `ionic://` / `http(s)://localhost`,
   via `@app.after_request _live_cors`) pro shell nativo Capacitor — uploads/
   CRUD seguem same-origin. Estado por-processo: no Cloud Run **exige a
-  instância fixa em 1** (min=max=1), senão POST e GET caem em processos
-  diferentes e o app não vê (mesma razão do `--workers 1`).
+  instância fixa em 1** — `deploy-cloudrun.sh` pina `--max-instances=1`
+  (default; o serviço rodou com max=5 até 09/2026, quando o catálogo também
+  ficava exposto a lost update entre instâncias — o store não tem
+  precondição de geração). min=0 continua o default por custo; o warm-up de
+  boot amortece o cold start.
 
 ## Clips workflow
 
@@ -602,6 +660,59 @@ writes RDF directly. App.js reads `ph:Video` from `uploads.ttl` only.
 
 ## Conventions — please follow
 
+- **`index.html` carrega `<base href="/">`.** Abrir um passeio reescreve a
+  barra pra `/passeio/<slug>` (`_setTourUrl`, replaceState) e, sem o base,
+  toda URL relativa construída DEPOIS (`./data/tours.ttl` do resumo do
+  modal, `./saved-routes`, `./upload_tour.html`…) resolvia um nível abaixo →
+  404 silencioso (o resumo do passeio nunca carregava pra quem entrava pela
+  home). O SSR de `/passeio/<slug>` já injetava esse base; agora o estático
+  traz e a injeção é idempotente (`if "<base " not in html_text`). CSP tem
+  `base-uri 'self'`; os `href="#"` do app são todos preventDefault'ados.
+- **Catálogo residente em memória (`_dumps`).** Cada dump fica em memória
+  como TEXTO (o que `/data/<ttl>` serve) e como GRAFO rdflib VIVO, parseado
+  uma vez e mutado in place pelos RMW — nada de `STORE.read_text` + parse +
+  serialize de ~430 KB por gravação (era ~120–240 ms por foto, ×6 leituras
+  num save de passeio, e em GCS cada leitura era HEAD+GET). Regras: mutação
+  SEMPRE via `with _mutating("images.ttl") as g:` (grafo vivo sob
+  `_state_lock`; commita ao sair — serializa, grava, atualiza o texto,
+  invalida o snapshot; se o corpo ou a gravação levantar, descarta o grafo
+  vivo e o próximo acesso re-parseia o último estado PERSISTIDO — memória e
+  store nunca divergem); o grafo vivo (`_dump_graph`) só é tocado sob o lock,
+  iteração inclusive (add/remove concorrente a uma iteração estoura o store
+  de memória do rdflib); leitura fora do lock usa `_load_catalog()`, um
+  SNAPSHOT imutável da união refeito preguiçosamente depois de cada commit
+  (~14k adds, dezenas de ms). `_tours_graph()` (feed/SSR/route-sync) segue
+  cacheado por digest do texto. Escritas fora de banda no bucket
+  (`state-history.sh restore`, `deploy --state`, edição manual) continuam
+  exigindo `POST /reload`, que agora zera texto E grafos.
+- **Nunca deixar o owlrl trocar os conversores de datatype do rdflib.**
+  `_load_validator` seta `owlrl.DeductiveClosure.improved_datatype_generic =
+  True` + `use_RDFLib_lexical_conversions()`. Sem isso, cada closure rdfs do
+  pyshacl instalava `use_Alt_lexical_conversions()` GLOBALMENTE e restaurava
+  no fim — e um Turtle parseado por OUTRA thread nesse intervalo saía com o
+  offset dos `xsd:dateTime` deslocado uma hora (`-03:00` → `-04:00`). Como
+  cada gravação re-serializava o catálogo, o desvio acumulava: 435 das 460
+  datas de mídia chegaram a offsets até `-23:00` (wall-clock certo, offset
+  errado — conferido contra o EXIF dos originais). Reprodutível com um
+  harness de threads; `scripts/migrate-date-offsets.py` repara o acumulado.
+- **Uploads não seguram o lock global durante a transferência.**
+  `/upload-image` E `/upload-video` (este era `@serialized` inteiro) recebem
+  o corpo, validam (só o `pyshacl.validate` serializa, sob `_validate_lock`)
+  e gravam blobs FORA do `_state_lock`; só o RMW do catálogo, com
+  re-checagem TOCTOU da colisão cross-type, roda sob o lock. Não reintroduzir
+  `@serialized` num handler que lê `request.files`.
+- **Os forms avisam o app-pai por `postMessage`** — `phidro-media-changed`
+  (upload_images.html: envio, edição) e `phidro-tour-changed`
+  (upload_tour.html: save, delete). O app marca o modal como "sujo" e só
+  chama `reloadPhotos()` ao fechar se algo foi salvo; fechar sem salvar não
+  custa mais 4 dumps + rebuild de marcadores. Um novo caminho de escrita num
+  form precisa emitir a mensagem, senão o mapa só atualiza no próximo reload.
+- **Vídeo transcoda num passe só** (`transcodeClip` em upload_images.html:
+  um `<video>`, dois canvases no mesmo rAF, três MediaRecorders — áudio-only,
+  720p, 360p — com a trilha de áudio clonada). MediaRecorder é tempo real:
+  os três passes em série custavam 3× a duração do recorte. Falhou (browser
+  recusa 3 recorders)? Cai pro sequencial antigo, que fica no arquivo por
+  isso.
 - **Bump `sw.js` `VERSION`** on *any* change to files in `web/` —
   otherwise the service worker serves stale cached copies and the change
   won't reach users. It's a monotonic `phidro-vN` integer counter; just

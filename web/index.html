@@ -2,6 +2,13 @@
 <html lang="pt-br">
   <head>
     <meta charset="utf-8" />
+    <!-- <base>: abrir um passeio reescreve a barra pra /passeio/<slug>
+         (history.replaceState) e, sem isto, toda URL relativa construída
+         DEPOIS (./data/tours.ttl do resumo, ./saved-routes…) resolvia um nível
+         abaixo → 404 (o resumo do passeio no modal nunca carregava). O SSR de
+         /passeio/<slug> já servia o index com este <base>; agora o estático
+         também traz (a injeção do SSR virou idempotente). CSP: base-uri 'self'. -->
+    <base href="/" />
     <!-- maximum-scale=1 + user-scalable=no: o iOS NÃO dá zoom automático ao
          focar um input (font < 16px), o que antes "sumia" com a interface (a
          tela zumia e não voltava). O zoom do MAPA é do Leaflet (JS), então
@@ -213,6 +220,31 @@
           <details class="help-changelog">
             <summary>Novidades (changelog)</summary>
             <dl>
+              <dt>05/09/2026 · v399</dt>
+              <dd>
+                <ul>
+                  <li><strong>Criar, editar e enviar ficou bem mais rápido:</strong> a validação de cada foto/vídeo/passeio caiu de ~1,5 s pra milissegundos (o servidor só valida o que o envio referencia), o catálogo fica residente em memória (sem re-ler e re-parsear ~430 KB a cada gravação), vídeos são transcodados num passe só (antes 3× a duração do recorte), os formulários abrem sem esperar CDNs (N3 vendorado, HEIC sob demanda), os catálogos baixam em paralelo e fechar um modal sem salvar não recarrega mais o mapa. Salvar uma rota responde na hora — o card de compartilhamento renderiza em segundo plano.</li>
+                  <li><strong>Consertos:</strong> o resumo do passeio no modal da rota voltou a carregar (era um 404 silencioso); as datas das fotos não deslocam mais o fuso a cada envio (bug de concorrência do validador — <code>scripts/migrate-date-offsets.py</code> repara as já afetadas); arquivos escolhidos enquanto o form de envio ainda carrega não são mais descartados, e uma segunda seleção durante o processamento entra na fila.</li>
+                </ul>
+              </dd>
+              <dt>04/09/2026 · v398</dt>
+              <dd>
+                <ul>
+                  <li><strong>Markdown para agentes:</strong> toda página responde em Markdown limpo a <code>Accept: text/markdown</code> (ou <code>?format=md</code>) — home, passeios, Memória, séries, pessoas, mídias, listas e vocabulário; HTML segue o padrão. As páginas também anunciam a API pra agentes (header <code>Link</code> de descoberta, <code>/.well-known/api-catalog</code>, <code>/openapi.json</code>).</li>
+                </ul>
+              </dd>
+              <dt>01/09/2026 · v397</dt>
+              <dd>
+                <ul>
+                  <li>Envio de fotos: um fuso horário corrompido no EXIF (ex.: +45:00) não entra mais no catálogo — cai no fuso do aparelho. Erros de persistência agora ficam com o rastro completo no log do servidor.</li>
+                </ul>
+              </dd>
+              <dt>01/09/2026 · v396</dt>
+              <dd>
+                <ul>
+                  <li><strong>Memória Hidrográfica: botão "Subir imagens"</strong> ao lado do Editar em cada passeio — abre o formulário de envio de fotos/vídeos já apontando pra ele.</li>
+                </ul>
+              </dd>
               <dt>01/09/2026 · v395</dt>
               <dd>
                 <ul>

@@ -722,14 +722,12 @@ async function loadData() {
     ];
   }
   // Baixa e concatena o texto de todos os grafos, depois parseia tudo junto.
-  const parts = [];
-  for (const u of urls) {
-    try {
-      const r = await fetch(u, { cache: 'no-cache' });
-      if (!r.ok) { console.warn(`[imagens] ${u}: HTTP ${r.status}`); continue; }
-      parts.push(await r.text());
-    } catch (err) { console.warn(`[imagens] ${u}: ${err.message}`); }
-  }
+  // Em PARALELO (eram N round trips em série), concatenados na ordem.
+  const parts = (await Promise.all(urls.map((u) =>
+    fetch(u, { cache: 'no-cache' })
+      .then((r) => { if (!r.ok) { console.warn(`[imagens] ${u}: HTTP ${r.status}`); return null; } return r.text(); })
+      .catch((err) => { console.warn(`[imagens] ${u}: ${err.message}`); return null; })
+  ))).filter((t) => t != null);
   const text = parts.join('\n\n');
   return new N3.Parser().parse(text);
 }

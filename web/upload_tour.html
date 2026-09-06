@@ -365,6 +365,17 @@ async function loadScript(src) {
 if (!window.TomSelect) await loadScript('./lib/tom-select.complete.min.js');
 const TomSelect = window.TomSelect;
 
+// N3.js VENDORADO (UMD → window.N3): o import de esm.sh era a cadeia mais
+// longa do boot e caía com ETP/offline. Uma vez só, sob demanda.
+let _n3P = null;
+function n3Parser() {
+  return _n3P ||= (window.N3 ? Promise.resolve() : loadScript('./lib/n3.min.js'))
+    .then(() => window.N3.Parser);
+}
+// Texto dos dumps baixados no boot — o prefill de edição (?id=) reusa em vez
+// de baixar tours.ttl de novo.
+const catalogText = new Map();
+
 // ────────────────────── Constantes RDF ───────────────────────────────
 const PH_NS  = 'https://id.pedalhidrografi.co/terms#';
 const PHD_NS = 'https://pedalhidrografi.co/data/';
@@ -620,15 +631,20 @@ providerOptions.push({ value: 'ph:amora',  text: 'Amora (rota salva)' });
 async function loadCatalog() {
   let Parser;
   try {
-    ({ Parser } = await import('https://esm.sh/n3@1.17.4?bundle'));
+    Parser = await n3Parser();
   } catch { return; }
   const types = new Map(), names = new Map(), titles = new Map();
   const providers = new Set();
-  for (const url of ['./data/tours.ttl', './data/identities.ttl']) {
+  // Os dois dumps em paralelo (eram 2 round trips em série); no-cache pra que
+  // o prefill de edição (que reusa o texto) veja o estado vigente.
+  const CATALOG_URLS = ['./data/tours.ttl', './data/identities.ttl'];
+  const texts = await Promise.all(CATALOG_URLS.map((url) =>
+    fetch(url, { cache: 'no-cache' }).then((res) => (res.ok ? res.text() : null)).catch(() => null)));
+  for (const [i, text] of texts.entries()) {
+    const url = CATALOG_URLS[i];
+    if (text == null) continue;
+    catalogText.set(url, text);
     try {
-      const res = await fetch(url);
-      if (!res.ok) continue;
-      const text = await res.text();
       for (const q of new Parser().parse(text)) {
         const s = q.subject.value, p = q.predicate.value, o = q.object.value;
         if (p === RDF_TYPE) { if (!types.has(s)) types.set(s, new Set()); types.get(s).add(o); }
@@ -1085,6 +1101,17 @@ $('#preview').addEventListener('click', () => {
   }
 });
 
+// Avisa o app-pai (iframe modal) que o catálogo de passeios mudou: ele marca
+// o modal como "sujo" e recarrega ao fechar — antes recarregava sempre, mesmo
+// fechando sem salvar.
+function notifyParentTourChanged(tourId) {
+  try {
+    if (window.parent !== window) {
+      window.parent.postMessage({ type: 'phidro-tour-changed', tourId }, window.location.origin);
+    }
+  } catch (_) {}
+}
+
 $('#form').addEventListener('submit', async (ev) => {
   ev.preventDefault();
   clearNotices();
@@ -1117,6 +1144,7 @@ $('#form').addEventListener('submit', async (ev) => {
         ? ` · <a href="${escapeHtml(json.announcement_url)}" target="_blank">imagem</a>`
         : '';
       notice(`✓ Salvo: <code>pas:${escapeHtml(json.tour_id)}</code>${aurl}. Catálogo recarregado.`, 'ok');
+      notifyParentTourChanged(json.tour_id);
       // Status da sincronização da rota (routes.json) — best-effort no backend.
       const r = json.route || {};
       const provLabel = r.provider === 'amora' ? 'da rota salva do Amora' : 'do RideWithGPS';
@@ -1160,16 +1188,18 @@ notice(
 async function prefillFromId(tourId) {
   let Parser;
   try {
-    ({ Parser } = await import('https://esm.sh/n3@1.17.4?bundle'));
+    Parser = await n3Parser();
   } catch {
     notice('Não consegui carregar parser N3 pra prefill.', 'err');
     return;
   }
-  let text;
+  let text = catalogText.get('./data/tours.ttl');   // já baixado no boot (no-cache)
   try {
-    const res = await fetch('./data/tours.ttl', { cache: 'no-cache' });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    text = await res.text();
+    if (!text) {
+      const res = await fetch('./data/tours.ttl', { cache: 'no-cache' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      text = await res.text();
+    }
   } catch (e) {
     notice(`Tours.ttl indisponível: ${escapeHtml(e.message)}`, 'err');
     return;
@@ -1425,6 +1455,7 @@ async function prefillFromId(tourId) {
       const json = await res.json().catch(() => ({}));
       if (res.ok) {
         notice(`✓ Apagado: ${escapeHtml(json.triples || 0)} triples, ${escapeHtml(json.assets || 0)} arquivo(s).`, 'ok');
+        notifyParentTourChanged(tourId);
         // Trava o form pra evitar submit acidental de um tour fantasma.
         $$('input, select, textarea, button').forEach(el => { el.disabled = true; });
       } else {

@@ -18,7 +18,7 @@
 // origin) e v371/v372 saíram na `deploy` (busca de endereços, ⇄ inverter).
 // v373 fica acima de tudo que já circulou, que é o que importa: se a VERSION
 // não crescer, o service worker serve cache velho.
-const VERSION = 'phidro-v395';
+const VERSION = 'phidro-v399';
 const STATIC_CACHE = `${VERSION}-static`;
 const RUNTIME_CACHE = `${VERSION}-runtime`;
 
@@ -39,6 +39,9 @@ const STATIC_ASSETS = [
   './img/amora-icon.png',
   './imagens.html',
   './pessoas.html',
+  './upload_images.html',   // forms de envio/passeio: abrem do cache (SWR) em vez de baixar a cada modal
+  './upload_tour.html',
+  './censo.html',
   './fonts/fonts.css',
   './fonts/ibm-plex-mono-400.woff2',
   './fonts/ibm-plex-mono-400i.woff2',
