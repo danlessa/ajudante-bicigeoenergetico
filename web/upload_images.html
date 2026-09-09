@@ -18,6 +18,16 @@
   body { font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 1400px; margin: 1.5rem auto; padding: 0 1rem;
     color: var(--text); background: var(--bg); transition: background .2s; }
   h1 { font-size: 1.4rem; margin: 0 0 .25rem; }
+  /* Barra superior: "← Voltar ao censo" (só quando se chegou pelo censo —
+     mesmo padrão do upload_tour.html). */
+  .topnav { display: flex; gap: .5rem; align-items: center; margin: 0 0 .75rem; }
+  .topnav[hidden] { display: none; }   /* display:flex venceria o [hidden] do UA */
+  .topnav a.back {
+    display: inline-block; padding: .35rem .7rem; border: 1px solid var(--border);
+    border-radius: 5px; background: var(--surface); color: var(--text);
+    text-decoration: none; font-size: .9rem;
+  }
+  .topnav a.back:hover { border-color: var(--accent); color: var(--accent); }
   p.lede { color: var(--muted); margin: 0 0 1rem; }
   a { color: var(--accent); }
   fieldset { border: 1px solid var(--border); padding: 1rem; margin: 1rem 0; border-radius: 8px; background: var(--panel); }
@@ -77,6 +87,9 @@
   .opts { display: flex; gap: 1rem; flex-wrap: wrap; }
   .opts label { display: flex; align-items: center; gap: .35rem; margin: 0; font-size: .9rem; }
   .opts input[type="checkbox"] { width: auto; accent-color: var(--accent); }
+  .card-prep-status { display: block; margin-top: .35rem; color: var(--muted, #666); min-height: 1em; }
+  .card-prep-status.ok { color: #2a7a3b; }
+  .card-prep-status.warn { color: #9a6a00; }
 
   /* Grid de cards (1 por foto) */
   /* Grade de miniaturas (visão geral de tudo que foi adicionado). */
@@ -235,6 +248,11 @@
 </head>
 <body>
 
+<div class="topnav" id="topnav" hidden>
+  <a class="back" id="back-censo" href="./censo.html"
+     title="Volta pro censo">← Voltar ao censo</a>
+</div>
+
 <h1>Subir imagens</h1>
 
 <form id="form">
@@ -359,6 +377,17 @@ $('#files')?.addEventListener('change', (e) => {
 // Embutido no iframe do app: o título vive na faixa do header do modal —
 // esconde o <h1> interno pra não duplicar. Standalone mostra normalmente.
 if (window.self !== window.top) $('h1')?.style.setProperty('display', 'none');
+
+// "← Voltar ao censo": só quando se chegou PELO censo — o botão "Subir" de lá
+// carrega `from=censo` (e o referrer serve de fallback). No modal Censo do app
+// o iframe navega pra cá, então voltar = navegar o próprio iframe de volta pra
+// ./censo.html (o app já trata esse caminho como "censo"). No modal "Subir
+// imagens" do app (sem from=censo) o botão não aparece — voltar é fechar.
+{
+  const fromCenso = new URLSearchParams(location.search).get('from') === 'censo'
+    || /\/censo\.html(\?|$)/.test(document.referrer || '');
+  if (fromCenso) $('#topnav').hidden = false;
+}
 
 // ===================== Dependências CDN ================================
 let exifr = null;
@@ -1443,6 +1472,14 @@ function buildCardElem(displayIdx, file, thumbBlob) {
 
 // Card pra vídeo. Mesma grade, mesmas seções de atribuição — troca o
 // painel de "Saída" pelo trim/preview e remove anonimizar/comprimir.
+// 720p é opcional por card. Default: ligado no desktop, desligado em
+// aparelho de toque (celular sobe pela rede móvel e o mapa só usa o 720p com
+// "HD" nos Ajustes). Mudar o checkbox persiste a preferência.
+const IS_TOUCH_DEVICE = (() => { try { return matchMedia('(pointer: coarse)').matches; } catch (_) { return false; } })();
+function hdDefault() {
+  try { const v = localStorage.getItem('phidro:uploadHd'); if (v !== null) return v === '1'; } catch (_) {}
+  return !IS_TOUCH_DEVICE;
+}
 function buildVideoCardElem(displayIdx, file) {
   const elem = document.createElement('div');
   elem.className = 'card';
@@ -1504,7 +1541,9 @@ function buildVideoCardElem(displayIdx, file) {
       <h4>Saída</h4>
       <div class="opts">
         <label><input type="checkbox" data-field="audio-only"> Apenas áudio (sem trilha de vídeo)</label>
+        <label title="O mapa só toca o 720p com “HD” ligado nos Ajustes; o arquivo pesa ~3× o 360p pra subir"><input type="checkbox" data-field="hd"> Também 720p (HD)</label>
       </div>
+      <small class="card-prep-status" aria-live="polite"></small>
     </div>
 
     <div class="card-section">
@@ -1540,12 +1579,17 @@ function buildVideoCardElem(displayIdx, file) {
       </div>
     </div>
   `;
+  $('[data-field="hd"]', elem).checked = hdDefault();
   $('.card-meta strong', elem).textContent = `${displayIdx}. ${file.name}`;
   populateTourSelect($('[data-field="tour"]', elem));
   return elem;
 }
 
 function removeCard(card) {
+  card.removed = true;
+  clearTimeout(card._specTimer);
+  if (card.proc) card.proc.controller.abort();
+  discardStaged(card);
   cardActivationObserver.unobserve(card.elem);   // no-op se já ativado/desativado
   destroyPersonSelect(card.authorTs);
   destroyPersonSelect(card.providerTs);
@@ -1963,8 +2007,9 @@ async function transcodeAtShortSide(blob, startSec, endSec, shortSide, onProgres
 // recorders (a trilha de áudio clonada pra cada um). Se o browser recusar
 // três recorders simultâneos, o chamador cai pro caminho sequencial antigo
 // (as funções abaixo continuam existindo por isso).
-async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 = true, onProgress } = {}) {
+async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 = true, onProgress, signal } = {}) {
   return new Promise(async (resolve, reject) => {
+    if (signal?.aborted) { reject(abortError()); return; }
     const video = document.createElement('video');
     const url = URL.createObjectURL(blob);
     video.src = url;
@@ -1983,8 +2028,31 @@ async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 =
       try { video.pause(); } catch (_) {}
       URL.revokeObjectURL(url);
     };
-    const done = (out) => { if (settled) return; settled = true; cleanup(); resolve(out); };
-    const fail = (err) => { if (settled) return; settled = true; cleanup(); reject(err instanceof Error ? err : new Error(String(err))); };
+    // A miniatura sai do MESMO passe (frame ~5% adentro do recorte, ou 0,5 s
+    // no máximo) — antes era um segundo decode+seek (videoFirstFrameBlob)
+    // em série antes de transcodar.
+    let thumbPromise = null, thumbTaken = false;
+    const thumbAt = startSec + Math.min(0.5, Math.max(0.001, endSec - startSec) * 0.05);
+    const takeThumb = () => {
+      if (thumbTaken) return;
+      thumbTaken = true;
+      try {
+        const W = Math.min(320, video.videoWidth || 320);
+        const H = Math.round((video.videoHeight || 180) * (W / (video.videoWidth || 320)));
+        const c = document.createElement('canvas');
+        c.width = W; c.height = H;
+        c.getContext('2d').drawImage(video, 0, 0, W, H);
+        thumbPromise = new Promise((r) => c.toBlob(r, 'image/jpeg', 0.8));
+      } catch (_) { thumbPromise = null; }
+    };
+    const onAbort = () => fail(abortError());
+    const done = (out) => {
+      if (settled) return;
+      settled = true; cleanup(); signal?.removeEventListener('abort', onAbort);
+      Promise.resolve(thumbPromise).then((t) => resolve({ ...out, thumb: t || null }), () => resolve({ ...out, thumb: null }));
+    };
+    const fail = (err) => { if (settled) return; settled = true; cleanup(); signal?.removeEventListener('abort', onAbort); reject(err instanceof Error ? err : new Error(String(err))); };
+    signal?.addEventListener('abort', onAbort, { once: true });
     try {
       await waitVideoEvent(video, 'loadedmetadata', 'vídeo não carregou');
       const iw = video.videoWidth, ih = video.videoHeight;
@@ -2048,10 +2116,12 @@ async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 =
         if (stopped || settled) return;
         if (video.currentTime >= endSec || video.ended) {
           stopped = true;
+          takeThumb();   // recorte curtíssimo: garante a miniatura no último quadro
           for (const r of recorders) { try { r.stop(); } catch (_) {} }
           return;
         }
         for (const d of draws) d();
+        if (!thumbTaken && video.currentTime >= thumbAt) takeThumb();
         if (onProgress) onProgress(Math.min(1, (video.currentTime - startSec) / dur));
         raf = requestAnimationFrame(render);
       };
@@ -2061,6 +2131,285 @@ async function transcodeClip(blob, startSec, endSec, { want720 = true, want360 =
     }
   });
 }
+
+// ===================== Vídeo: caminho rápido (WebCodecs) ================
+// O MediaRecorder grava em TEMPO REAL: um recorte de 40 s custa 40 s de
+// espera por construção, por mais rápido que seja o aparelho. Com WebCodecs
+// (VideoDecoder/VideoEncoder/AudioEncoder, nos codecs de hardware) o mesmo
+// recorte sai em poucos segundos. Demux/decode/encode/mux ficam com a
+// mediabunny (vendorada em lib/mediabunny.min.mjs, MPL-2.0, carregada sob
+// demanda). Só entra quando o navegador ENCODA VP9 ou VP8 + opus — é o que o
+// WebM (que o catálogo e o mapa esperam) exige; o Safari só encoda H.264 e
+// cai pro MediaRecorder. Qualquer falha aqui cai pro passe único acima, e
+// dele pro sequencial — a cadeia mora em processClip.
+let _mediabunnyPromise = null;
+function loadMediabunny() {
+  if (!_mediabunnyPromise) _mediabunnyPromise = import('./lib/mediabunny.min.mjs');
+  return _mediabunnyPromise;
+}
+// Debug: `?slow=1` força o caminho MediaRecorder (pra comparar/reproduzir).
+const FORCE_SLOW_TRANSCODE = new URLSearchParams(location.search).has('slow');
+let _fastProbe = null;
+// Resolve o codec de vídeo do caminho rápido ('vp9' | 'vp8') ou false.
+function fastTranscodeCodec() {
+  if (_fastProbe) return _fastProbe;
+  _fastProbe = (async () => {
+    if (FORCE_SLOW_TRANSCODE) return false;
+    if (typeof VideoEncoder === 'undefined' || typeof VideoDecoder === 'undefined' || typeof AudioEncoder === 'undefined') return false;
+    const mb = await loadMediabunny();
+    const [vp9, vp8, opus] = await Promise.all([
+      mb.canEncodeVideo('vp9', { width: 1280, height: 720 }),
+      mb.canEncodeVideo('vp8', { width: 1280, height: 720 }),
+      mb.canEncodeAudio('opus'),
+    ]);
+    if (!opus) return false;
+    return vp9 ? 'vp9' : (vp8 ? 'vp8' : false);
+  })().catch(() => false);
+  return _fastProbe;
+}
+function abortError() { return new DOMException('processamento cancelado', 'AbortError'); }
+function isAbortError(e) { return e?.name === 'AbortError'; }
+// Dimensões de saída pro lado curto pedido (mesma regra do MediaRecorder:
+// mantém a proporção, arredonda pra par).
+function outputDims(iw, ih, shortSide) {
+  const aspect = iw / ih;
+  let w, h;
+  if (iw >= ih) { h = shortSide; w = Math.round(shortSide * aspect); }
+  else          { w = shortSide; h = Math.round(shortSide / aspect); }
+  return { width: w - (w % 2), height: h - (h % 2) };
+}
+const VIDEO_BITRATE = { 720: 1_600_000, 360: 700_000 };   // iguais aos do MediaRecorder
+function canvasToJpeg(canvas) {
+  if (typeof OffscreenCanvas !== 'undefined' && canvas instanceof OffscreenCanvas) {
+    return canvas.convertToBlob({ type: 'image/jpeg', quality: 0.8 });
+  }
+  return new Promise((r) => canvas.toBlob(r, 'image/jpeg', 0.8));
+}
+async function transcodeClipFast(file, startSec, endSec, { want720 = true, want360 = true, onProgress, signal } = {}) {
+  const vcodec = await fastTranscodeCodec();
+  if (!vcodec) throw new Error('WebCodecs indisponível');
+  const mb = await loadMediabunny();
+  const input = new mb.Input({ source: new mb.BlobSource(file), formats: mb.ALL_FORMATS });
+  const [vtrack, atrack] = await Promise.all([input.getPrimaryVideoTrack(), input.getPrimaryAudioTrack()]);
+  if (!atrack) throw new Error('sem trilha de áudio');   // ph:audio é obrigatório
+  const wantVideo = want720 || want360;
+  if (wantVideo && !vtrack) throw new Error('sem trilha de vídeo');
+  if (!(await atrack.canDecode())) throw new Error(`áudio (${atrack.codec}): decoder indisponível`);
+  if (wantVideo && !(await vtrack.canDecode())) throw new Error(`vídeo (${vtrack.codec}): decoder indisponível`);
+  const throwIfAborted = () => { if (signal?.aborted) throw abortError(); };
+  throwIfAborted();
+  const iw = vtrack?.displayWidth || 0, ih = vtrack?.displayHeight || 0;
+  const weights = { audio: 0.15, blob720: want720 ? 0.5 : 0, blob360: want360 ? 0.35 : 0 };
+  const wsum = Object.values(weights).reduce((a, b) => a + b, 0);
+  const prog = {};
+  const report = () => {
+    if (!onProgress) return;
+    let acc = 0;
+    for (const [k, f] of Object.entries(prog)) acc += f * weights[k];
+    onProgress(Math.min(1, acc / wsum));
+  };
+  const run = async (key, shortSide) => {
+    throwIfAborted();
+    const output = new mb.Output({ format: new mb.WebMOutputFormat(), target: new mb.BufferTarget() });
+    const video = shortSide
+      ? { codec: vcodec, ...outputDims(iw, ih, shortSide), fit: 'contain', bitrate: VIDEO_BITRATE[shortSide],
+          frameRate: 30, forceTranscode: true }
+      : { discard: true };
+    const conv = await mb.Conversion.init({
+      input, output, trim: { start: startSec, end: endSec }, showWarnings: false, copy: false,
+      video,
+      audio: { codec: 'opus', bitrate: shortSide ? 128_000 : 192_000, forceTranscode: true },
+    });
+    if (!conv.isValid) {
+      throw new Error(`conversão inválida (${key}): ` + conv.discardedTracks.map((d) => d.reason).join(', '));
+    }
+    conv.onProgress = (f) => { prog[key] = f; report(); };
+    const onAbort = () => { conv.cancel().catch(() => {}); };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    try {
+      await conv.execute();
+    } catch (e) {
+      if (signal?.aborted || e instanceof mb.ConversionCanceledError) throw abortError();
+      throw e;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+    }
+    prog[key] = 1; report();
+    return new Blob([output.target.buffer], { type: shortSide ? 'video/webm' : 'audio/webm' });
+  };
+  // Áudio ∥ 720p (o áudio não ocupa decoder de vídeo), depois o 360p: dois
+  // decoders de vídeo de hardware simultâneos estouram em celular.
+  const [audio, blob720] = await Promise.all([run('audio', 0), want720 ? run('blob720', 720) : null]);
+  const blob360 = want360 ? await run('blob360', 360) : null;
+  let thumb = null;
+  if (vtrack) {
+    try {
+      const sink = new mb.CanvasSink(vtrack, { width: 320, fit: 'contain' });
+      const wc = await sink.getCanvas(startSec + Math.min(0.5, (endSec - startSec) * 0.05));
+      if (wc) thumb = await canvasToJpeg(wc.canvas);
+    } catch (e) { console.warn('miniatura (WebCodecs) falhou:', e.message); }
+  }
+  return { audio, blob720, blob360, thumb };
+}
+
+// ===================== Vídeo: pipeline + preparação em segundo plano ====
+// Um recorte é identificado por `clipParams(card).key` (início|fim|áudio-só|
+// hd). processClip escolhe o motor — WebCodecs → MediaRecorder passe único →
+// sequencial — e sempre devolve { audio, blob360, blob720, thumb, engine }.
+// ensureProcessed memoiza por key em card.proc (cancelando um processamento
+// de key diferente ainda em voo); a preparação ESPECULATIVA roda assim que o
+// card ativa e a cada mudança de recorte (debounced), de modo que, na hora do
+// Enviar, o resultado normalmente já existe — e já foi PRÉ-ENVIADO pro
+// servidor (stageClip), restando só gravar o catálogo.
+function clipParams(card) {
+  const elem = card.elem;
+  const audioOnly = $('[data-field="audio-only"]', elem).checked;
+  const hd = !audioOnly && $('[data-field="hd"]', elem).checked;
+  const tStart = parseFloat($('[data-field="trim-start"]', elem).value) || 0;
+  const tEnd   = parseFloat($('[data-field="trim-end"]',   elem).value) || 0;
+  const dur = tEnd - tStart;
+  let error = null;
+  if (dur <= 0.1) error = 'recorte muito curto';
+  else if (dur > 600.5) error = 'recorte > 10 min';
+  return { tStart, tEnd, audioOnly, hd, error, key: `${tStart}|${tEnd}|${audioOnly ? 'a' : (hd ? 'v-hd' : 'v-sd')}` };
+}
+async function processClip(card, p, { onProgress, signal, onEngine } = {}) {
+  const file = card.file;
+  const opts = { want720: !p.audioOnly && p.hd, want360: !p.audioOnly, onProgress, signal };
+  try {
+    onEngine?.('WebCodecs');
+    const out = await transcodeClipFast(file, p.tStart, p.tEnd, opts);
+    return { ...out, engine: 'WebCodecs' };
+  } catch (e) {
+    if (isAbortError(e) || signal?.aborted) throw abortError();
+    console.warn('transcode WebCodecs indisponível/falhou — caindo pro MediaRecorder:', e.message);
+  }
+  try {
+    onEngine?.('MediaRecorder');
+    const out = await transcodeClip(file, p.tStart, p.tEnd, opts);
+    return { ...out, engine: 'MediaRecorder' };
+  } catch (e) {
+    if (isAbortError(e) || signal?.aborted) throw abortError();
+    console.warn('transcode em passe único falhou — caindo pro sequencial:', e.message);
+  }
+  // Sequencial (3 passes, cada um ≈ a duração do recorte): último recurso.
+  onEngine?.('sequencial');
+  const thumb = await videoFirstFrameBlob(file).catch(() => null);
+  if (signal?.aborted) throw abortError();
+  const audio = await extractAudio(file, p.tStart, p.tEnd, onProgress);
+  let blob720 = null, blob360 = null;
+  if (!p.audioOnly) {
+    if (signal?.aborted) throw abortError();
+    if (p.hd) blob720 = await transcodeAtShortSide(file, p.tStart, p.tEnd, 720, onProgress);
+    if (signal?.aborted) throw abortError();
+    blob360 = await transcodeAtShortSide(file, p.tStart, p.tEnd, 360, onProgress);
+  }
+  return { audio, blob720, blob360, thumb, engine: 'sequencial' };
+}
+// Um transcode de vídeo por vez (dois em máquinas com ≥ 8 threads): cada um é
+// um decoder de hardware + 2 encoders (WebCodecs) ou um <video> tocando + 3
+// MediaRecorders — concorrência só derruba frames em celular.
+const TRANSCODE_POOL = makeLimiter((navigator.hardwareConcurrency || 2) >= 8 ? 2 : 1);
+function ensureProcessed(card, p, hooks = {}) {
+  const cur = card.proc;
+  if (cur && cur.key === p.key && !cur.failed) {
+    Object.assign(cur.hooks, hooks);   // quem chamou por último (o Enviar) assume o status
+    return cur.promise;
+  }
+  if (cur) cur.controller.abort();
+  cancelStaging(card);
+  const controller = new AbortController();
+  const proc = { key: p.key, controller, hooks: { ...hooks }, result: null, failed: false, engine: '', startedAt: 0 };
+  proc.promise = TRANSCODE_POOL(async () => {
+    if (controller.signal.aborted) throw abortError();
+    proc.startedAt = performance.now();
+    return processClip(card, p, {
+      signal: controller.signal,
+      onProgress: (f) => proc.hooks.onProgress?.(f),
+      onEngine: (label) => { proc.engine = label; proc.hooks.onEngine?.(label); },
+    });
+  }).then((r) => { proc.result = r; return r; }, (e) => { proc.failed = true; throw e; });
+  card.proc = proc;
+  return proc.promise;
+}
+function setPrepStatus(card, label, kind = '') {
+  const el = $('.card-prep-status', card.elem);
+  if (!el) return;
+  el.textContent = label;
+  el.className = `card-prep-status ${kind}`;
+}
+const SPECULATE_DELAY_MS = 1200;
+function scheduleSpeculativeTranscode(card, delayMs = SPECULATE_DELAY_MS) {
+  clearTimeout(card._specTimer);
+  card._specTimer = setTimeout(() => speculativeTranscode(card), delayMs);
+}
+function speculativeTranscode(card) {
+  if (card.uploaded || card.removed || card.sending || !card.activated || !card.duration) return;
+  const p = clipParams(card);
+  if (p.error) { setPrepStatus(card, p.error, 'warn'); return; }
+  if (card.proc?.key === p.key && !card.proc.failed) return;
+  ensureProcessed(card, p, {
+    onEngine:   (l) => setPrepStatus(card, `preparando em segundo plano (${l})…`),
+    onProgress: (f) => setPrepStatus(card, `preparando em segundo plano (${card.proc?.engine || ''})… ${Math.round(f * 100)}%`),
+  }).then((r) => {
+    if (card.proc?.key !== p.key) return;   // recorte mudou no meio — o novo cuida do status
+    const secs = ((performance.now() - card.proc.startedAt) / 1000).toFixed(1);
+    setPrepStatus(card, `pronto pra enviar (${r.engine} em ${secs} s)`, 'ok');
+    stageClip(card, p, r);
+  }).catch((e) => {
+    if (!isAbortError(e)) setPrepStatus(card, `preparação falhou: ${e.message} — processa de novo no envio`, 'warn');
+  });
+}
+
+// ── Pré-envio (staging) ──────────────────────────────────────────────────
+// Assim que o processamento especulativo termina, os blobs sobem pra
+// `POST /stage-video/<vhash>` — chaves finais content-addressed pelo vhash +
+// um marcador de staging que o servidor varre depois de 6 h se nenhum
+// catálogo referenciar o vhash. O Enviar então manda só o TTL (`staged=1`);
+// se o servidor não achar os blobs (varridos, reiniciado sem store), responde
+// 409 `staging-missing` e o cliente reenvia com os blobs. Sem backend (host
+// estático) o POST falha em silêncio e o envio segue com os blobs.
+const STAGE_VIDEO_URL = './stage-video/';
+function appendClipBlobs(fd, card, r, p) {
+  fd.append('audio', r.audio, `${card.clipId}.audio.webm`);
+  if (r.thumb) fd.append('thumb', r.thumb, `${card.clipId}.thumb.jpg`);
+  if (!p.audioOnly && r.blob360) fd.append('video360', r.blob360, `${card.clipId}.360p.webm`);
+  if (!p.audioOnly && p.hd && r.blob720) fd.append('video720', r.blob720, `${card.clipId}.720p.webm`);
+}
+function cancelStaging(card) {
+  if (card.staging) { card.staging.controller.abort(); card.staging = null; }
+  card.stagedKey = null;
+}
+function stageClip(card, p, r) {
+  if (!navigator.onLine || card.uploaded || card.removed) return null;
+  cancelStaging(card);
+  const controller = new AbortController();
+  const fd = new FormData();
+  appendClipBlobs(fd, card, r, p);
+  const promise = fetch(STAGE_VIDEO_URL + encodeURIComponent(card.clipId), { method: 'POST', body: fd, signal: controller.signal })
+    .then((res) => res.ok)
+    .catch(() => false);
+  const st = { key: p.key, controller, promise };
+  card.staging = st;
+  promise.then((ok) => {
+    if (card.staging !== st) return;   // cancelado/substituído
+    card.staging = null;
+    if (ok) {
+      card.stagedKey = p.key;
+      setPrepStatus(card, `pronto e já no servidor (${r.engine}) — Enviar só grava o catálogo`, 'ok');
+    }
+  });
+  return promise;
+}
+// Card removido / página fechada com blobs pré-enviados e não confirmados:
+// pede pro servidor apagar na hora (best-effort; a varredura cobre o resto).
+function discardStaged(card) {
+  const had = card.stagedKey || card.staging;
+  cancelStaging(card);
+  if (!had) return;
+  try { navigator.sendBeacon(STAGE_VIDEO_URL + encodeURIComponent(card.clipId) + '/discard'); } catch (_) {}
+}
+window.addEventListener('pagehide', () => { for (const c of cards) if (!c.uploaded) discardStaged(c); });
 
 // Extrai o áudio do trecho [startSec, endSec] como opus dentro de webm
 // — 192 kbps é perceptualmente transparente pra material falado/ambiente
@@ -2405,7 +2754,9 @@ async function createVideoCard(file, defaults) {
     authorTs: null, providerTs: null, listTs: null, skipAutoDetect: false,
     pendingAuthors: [], pendingProviders: [], pendingLists: [], activated: false,
     duration: 0,
-    processed: null,        // { tStart, tEnd, audioOnly, thumb, audio, blob360, blob720 } — cache do último processamento local (A6)
+    proc: null,             // processamento memoizado por recorte — ver ensureProcessed
+    staging: null, stagedKey: null,   // pré-envio dos blobs — ver stageClip
+    sending: false, removed: false,
     uploaded: false,
   };
   cards.push(card);
@@ -2486,9 +2837,19 @@ async function createVideoCard(file, defaults) {
     tStart.value = '0';
     updateTrimLabels();
     setCardSendEnabled(card, true);
+    scheduleSpeculativeTranscode(card, 400);   // recorte default: já começa a preparar
   });
   tStart.addEventListener('input', updateTrimLabels);
   tEnd.addEventListener('input',   updateTrimLabels);
+  // `change` = slider solto (input dispara a cada pixel). Debounced: re-prepara
+  // com o novo recorte, cancelando o que estava em voo.
+  tStart.addEventListener('change', () => scheduleSpeculativeTranscode(card));
+  tEnd.addEventListener('change',   () => scheduleSpeculativeTranscode(card));
+  $('[data-field="audio-only"]', elem).addEventListener('change', () => scheduleSpeculativeTranscode(card, 300));
+  $('[data-field="hd"]', elem).addEventListener('change', (e) => {
+    try { localStorage.setItem('phidro:uploadHd', e.target.checked ? '1' : '0'); } catch (_) {}
+    scheduleSpeculativeTranscode(card, 300);
+  });
   for (const btn of elem.querySelectorAll('.trim-step-btn')) {
     btn.addEventListener('click', () => {
       const step = parseFloat(btn.dataset.step);
@@ -2498,6 +2859,7 @@ async function createVideoCard(file, defaults) {
       inp.value = String(Math.max(0, Math.min(card.duration, cur + step)));
       inp.focus();
       updateTrimLabels();
+      scheduleSpeculativeTranscode(card);
     });
   }
 
@@ -2829,6 +3191,7 @@ function buildClipBlock(card) {
   const tour    = $('[data-field="tour"]',    elem).value.trim();
   const license = $('[data-field="license"]', elem).value;
   const audioOnly = $('[data-field="audio-only"]', elem).checked;
+  const wantHd    = $('[data-field="hd"]', elem).checked;
   const authors   = personValues(card, 'author');
   const providers = personValues(card, 'provider');
   const lists     = listValues(card);
@@ -2856,8 +3219,9 @@ function buildClipBlock(card) {
   const resolutions = ['"audio"'];
   if (!audioOnly) {
     props.push(`ph:video360p "${id}.360p.webm"`);
-    props.push(`ph:video720p "${id}.720p.webm"`);
-    resolutions.push('"360p"', '"720p"');
+    if (wantHd) props.push(`ph:video720p "${id}.720p.webm"`);
+    resolutions.push('"360p"');
+    if (wantHd) resolutions.push('"720p"');
   }
   props.push(`ph:availableResolution ${resolutions.join(', ')}`);
   if (tour)         props.push(`ph:capturedDuring ${tour}`);
@@ -3031,86 +3395,57 @@ async function uploadVideoCard(card) {
   // reprovaria o envio se QUALQUER outro card tivesse um campo inválido.
   const inputsValid = [...card.elem.querySelectorAll('input, select')].every((el) => el.reportValidity());
   if (!inputsValid) return false;
-  const elem = card.elem;
-  const audioOnly = $('[data-field="audio-only"]', elem).checked;
-  const tStart = parseFloat($('[data-field="trim-start"]', elem).value) || 0;
-  const tEnd   = parseFloat($('[data-field="trim-end"]',   elem).value) || 0;
-  if (tEnd - tStart <= 0.1) {
-    setCardStatus(card, 'recorte muito curto', 'err');
-    return false;
-  }
-  if (tEnd - tStart > 600.5) {
-    setCardStatus(card, 'recorte > 10 min', 'err');
+  const p = clipParams(card);
+  if (p.error) {
+    setCardStatus(card, p.error, 'err');
     return false;
   }
 
   setCardSendEnabled(card, false);
-  let ttl, audioBlob, thumbBlob = null, blob360 = null, blob720 = null;
-  // A6: se um envio anterior já processou este card com o MESMO recorte
-  // (trim início/fim) e a mesma opção "apenas áudio", reaproveita os blobs
-  // em vez de reextrair áudio + retranscodar 2× (cada passe ≈ a duração do
-  // recorte, em tempo real). Qualquer mudança no recorte invalida o cache.
-  const cached = card.processed;
-  const cacheHit = !!cached && cached.tStart === tStart && cached.tEnd === tEnd &&
-    cached.audioOnly === audioOnly;
+  card.sending = true;
+  clearTimeout(card._specTimer);
+  let ttl, result;
   try {
-    if (cacheHit) {
-      setCardStatus(card, 'reaproveitando processamento anterior…', 'warn');
-      thumbBlob = cached.thumb;
-      audioBlob = cached.audio;
-      blob360   = cached.blob360;
-      blob720   = cached.blob720;
-    } else {
-      setCardStatus(card, 'extraindo thumbnail…', 'warn');
-      thumbBlob = await videoFirstFrameBlob(card.file).catch(() => null);
-      // Passe único (áudio + 720p + 360p de uma vez, ~1× a duração do
-      // recorte) com progresso; fallback pro sequencial antigo (3 passes) se o
-      // browser recusar três recorders simultâneos.
-      const label = audioOnly ? 'extraindo áudio (opus 192k)' : 'transcodando áudio + 720p + 360p (passe único)';
-      let lastPct = -1;
-      const progress = (tag) => (p) => {
-        const pct = Math.round(p * 100);
-        if (pct !== lastPct) { lastPct = pct; setCardStatus(card, `${tag}… ${pct}%`, 'warn'); }
-      };
-      setCardStatus(card, `${label}…`, 'warn');
-      try {
-        const out = await transcodeClip(card.file, tStart, tEnd,
-          { want720: !audioOnly, want360: !audioOnly, onProgress: progress(label) });
-        audioBlob = out.audio;
-        blob720 = out.blob720 || null;
-        blob360 = out.blob360 || null;
-      } catch (e) {
-        console.warn('transcode em passe único falhou — caindo pro sequencial:', e.message);
-        lastPct = -1;
-        setCardStatus(card, 'extraindo áudio (opus 192k)…', 'warn');
-        audioBlob = await extractAudio(card.file, tStart, tEnd, progress('extraindo áudio'));
-        if (!audioOnly) {
-          lastPct = -1;
-          blob720 = await transcodeAtShortSide(card.file, tStart, tEnd, 720, progress('transcodando 720p'));
-          lastPct = -1;
-          blob360 = await transcodeAtShortSide(card.file, tStart, tEnd, 360, progress('transcodando 360p'));
-        }
-      }
-      card.processed = { tStart, tEnd, audioOnly, thumb: thumbBlob, audio: audioBlob, blob360, blob720 };
-    }
+    // Normalmente o recorte já foi preparado em segundo plano (ensureProcessed
+    // memoiza por key): aqui só se espera o que estiver em voo, ou processa
+    // do zero se o recorte mudou / nada foi preparado.
+    const inflight = card.proc?.key === p.key && !card.proc.failed && !card.proc.result;
+    setCardStatus(card, inflight ? 'aguardando a preparação em segundo plano…' : 'processando…', 'warn');
+    result = await ensureProcessed(card, p, {
+      onEngine:   (l) => setCardStatus(card, `transcodando (${l})…`, 'warn'),
+      onProgress: (f) => setCardStatus(card, `transcodando (${card.proc?.engine || ''})… ${Math.round(f * 100)}%`, 'warn'),
+    });
     ttl = buildSingleClipTtl(card);
   } catch (e) {
-    setCardStatus(card, `falha local: ${e.message}`, 'err');
+    setCardStatus(card, isAbortError(e) ? 'processamento cancelado' : `falha local: ${e.message}`, 'err');
     setCardSendEnabled(card, true);
+    card.sending = false;
     return false;
   }
 
-  const fd = new FormData();
-  fd.append('ttl', ttl);
-  fd.append('id',  card.clipId);
-  fd.append('audio', audioBlob, `${card.clipId}.audio.webm`);
-  if (thumbBlob) fd.append('thumb', thumbBlob, `${card.clipId}.thumb.jpg`);
-  if (blob360) fd.append('video360', blob360, `${card.clipId}.360p.webm`);
-  if (blob720) fd.append('video720', blob720, `${card.clipId}.720p.webm`);
-  setCardStatus(card, 'enviando…', 'warn');
-  try {
+  // Pré-envio do MESMO recorte ainda subindo? Esperar é mais barato que
+  // mandar os blobs de novo.
+  if (card.staging?.key === p.key) {
+    setCardStatus(card, 'aguardando o pré-envio terminar…', 'warn');
+    await card.staging.promise;
+  }
+  const send = async (useStaged) => {
+    const fd = new FormData();
+    fd.append('ttl', ttl);
+    fd.append('id',  card.clipId);
+    if (useStaged) fd.append('staged', '1');
+    else appendClipBlobs(fd, card, result, p);
+    setCardStatus(card, useStaged ? 'gravando no catálogo (blobs já no servidor)…' : 'enviando…', 'warn');
     const res = await fetch(UPLOAD_VIDEO_URL, { method: 'POST', body: fd });
     const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+  try {
+    let { res, data } = await send(card.stagedKey === p.key);
+    if (res.status === 409 && data.code === 'staging-missing') {
+      card.stagedKey = null;   // varrido/perdido no servidor → reenvia com os blobs
+      ({ res, data } = await send(false));
+    }
     if (!res.ok) {
       const detail = (data.details || []).join('; ') || data.error || `HTTP ${res.status}`;
       setCardStatus(card, `erro: ${detail}`, 'err');
@@ -3118,13 +3453,17 @@ async function uploadVideoCard(card) {
       return false;
     }
     card.uploaded = true;
-    setCardStatus(card, `✓ enviado (video_${card.clipId})`, 'ok');
+    card.stagedKey = null;
+    setCardStatus(card, `✓ enviado (video_${card.clipId}, ${result.engine})`, 'ok');
+    setPrepStatus(card, '');
     notifyParentChanged('upload-video', card.clipId);
     return true;
   } catch (e) {
     setCardStatus(card, `erro de rede: ${e.message}`, 'err');
     setCardSendEnabled(card, true);
     return false;
+  } finally {
+    card.sending = false;
   }
 }
 

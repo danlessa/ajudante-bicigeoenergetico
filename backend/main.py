@@ -4500,6 +4500,168 @@ def upsert_video_in_uploads(ttl_text, vid_id):
 # mutações pelo tempo do upload. Agora corpo + validação + blobs rodam fora do
 # lock; só o RMW do catálogo (com re-checagem TOCTOU da colisão cross-type)
 # roda sob _state_lock.
+# ── Vídeo: gravação dos blobs + pré-envio (staging) ──────────────────────
+# O form prepara o vídeo em segundo plano e PRÉ-ENVIA os blobs pra
+# `POST /stage-video/<vhash>` assim que ficam prontos; o `/upload-video` final
+# então só traz o TTL (`staged=1`). Chaves são as FINAIS (`clips/<vhash>.*`,
+# content-addressed pelo vhash — idempotente), mais um marcador
+# `clips/_staging/<vhash>` com o instante do pré-envio. Um pré-envio que nunca
+# vira upload (card removido, aba fechada) é varrido depois de
+# STAGING_MAX_AGE_S se o vhash não estiver no catálogo — na hora pelo
+# `/discard` (best-effort do cliente), senão pela varredura (boot + 1×/h).
+STAGING_PREFIX = "clips/_staging/"
+STAGING_MAX_AGE_S = int(os.environ.get("STAGING_MAX_AGE_S") or 6 * 3600)
+_CLIP_VARIANTS = (
+    # form field, sufixo da chave, content-type
+    ("audio", "audio.webm", "audio/webm"),
+    ("thumb", "thumb.jpg", "image/jpeg"),
+    ("video360", "360p.webm", "video/webm"),
+    ("video720", "720p.webm", "video/webm"),
+)
+_last_staging_sweep = 0.0
+
+
+def _is_vhash(s):
+    return bool(s) and len(s) == 16 and all(c in "0123456789abcdef" for c in s)
+
+
+def _clip_keys(vid_id):
+    return [f"clips/{vid_id}.{suffix}" for _, suffix, _ in _CLIP_VARIANTS]
+
+
+def _media_in_catalog(vid_id):
+    """O IRI de mídia (foto OU vídeo) já tem tipo no catálogo?"""
+    from rdflib import RDF, URIRef
+    return (URIRef(MED_NS + vid_id), RDF.type, None) in _load_catalog()
+
+
+def _write_clip_blobs(vid_id):
+    """Lê os blobs de `request.files` e grava todos EM PARALELO (eram quatro
+    round-trips em série no GCS). Devolve as chaves gravadas."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = []
+    for field, suffix, ctype in _CLIP_VARIANTS:
+        f = request.files.get(field)
+        if f:
+            jobs.append((f"clips/{vid_id}.{suffix}", f.read(), ctype))
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        # list() re-levanta a primeira exceção de gravação
+        list(ex.map(lambda j: STORE.write_bytes(j[0], j[1], content_type=j[2]), jobs))
+    return [k for k, _, _ in jobs]
+
+
+def _clip_keys_from_ttl(ttl_text, vid_id):
+    """Chaves de blob que o TTL do vídeo referencia (ph:audio, ph:video360p,
+    ph:video720p, schema:thumbnail — relativas a clips/). Valores fora do
+    padrão `<vhash>.<sufixo>` levantam ValueError (o TTL vem do cliente)."""
+    from rdflib import Graph, URIRef
+    g = Graph()
+    g.parse(data=ttl_text, format="turtle")
+    subj = URIRef(MED_NS + vid_id)
+    allowed = {f"{vid_id}.{suffix}" for _, suffix, _ in _CLIP_VARIANTS}
+    keys = []
+    for pred in (PH_NS + "audio", PH_NS + "video360p", PH_NS + "video720p",
+                 "https://schema.org/thumbnail"):
+        for o in g.objects(subj, URIRef(pred)):
+            rel = str(o).strip()
+            if rel not in allowed:
+                raise ValueError(f"caminho de blob inesperado no TTL: {rel!r}")
+            keys.append(f"clips/{rel}")
+    return keys
+
+
+def _sweep_staging(max_age_s=STAGING_MAX_AGE_S):
+    """Apaga pré-envios abandonados: marcador mais velho que max_age_s cujo
+    vhash NÃO está no catálogo → blobs + marcador vão embora; se está no
+    catálogo (upload concluiu e o marcador sobrou), só o marcador."""
+    try:
+        keys = STORE.list_keys(STAGING_PREFIX)
+    except Exception as e:  # noqa: BLE001
+        print(f"[staging] varredura: não listou {STAGING_PREFIX}: {e}")
+        return 0
+    if not keys:
+        return 0
+    now = datetime.now(timezone.utc)
+    n = 0
+    for key in keys:
+        vid_id = key.rsplit("/", 1)[-1]
+        if not _is_vhash(vid_id):
+            continue
+        try:
+            stamp = datetime.fromisoformat((STORE.read_text(key) or "").strip())
+        except Exception:  # noqa: BLE001
+            stamp = None
+        if stamp is not None and (now - stamp).total_seconds() < max_age_s:
+            continue
+        try:
+            if not _media_in_catalog(vid_id):
+                for k in _clip_keys(vid_id):
+                    STORE.delete(k)
+            STORE.delete(key)
+            n += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[staging] varredura: falha em {vid_id}: {e}")
+    if n:
+        print(f"[staging] varredura apagou {n} pré-envio(s) abandonado(s)")
+    return n
+
+
+def _maybe_sweep_staging_async(min_interval_s=3600):
+    global _last_staging_sweep
+    import time as _time
+    now = _time.monotonic()
+    if now - _last_staging_sweep < min_interval_s:
+        return
+    _last_staging_sweep = now
+    threading.Thread(target=_sweep_staging, name="staging-sweep", daemon=True).start()
+
+
+@app.post("/stage-video/<vid_id>")
+def stage_video(vid_id):
+    """Pré-envio dos blobs de um vídeo ainda não catalogado (ver bloco acima).
+    Mesmos campos de arquivo do /upload-video, sem TTL."""
+    vid_id = (vid_id or "").strip().lower()
+    if not _is_vhash(vid_id):
+        return jsonify(error="id inválido (esperado vhash de 16 hex)"), 400
+    if not request.files.get("audio"):
+        return jsonify(error="audio ausente (sempre obrigatório)"), 400
+    # Nunca sobrescreve blobs de mídia já catalogada (o form deduplica antes,
+    # mas o servidor não confia nisso).
+    if _media_in_catalog(vid_id):
+        return jsonify(error=f"med:{vid_id} já existe no catálogo", id=vid_id), 409
+    try:
+        written = _write_clip_blobs(vid_id)
+        STORE.write_text(STAGING_PREFIX + vid_id, datetime.now(timezone.utc).isoformat(),
+                         content_type="text/plain")
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        return jsonify(error=f"pré-envio: {e}", id=vid_id), 500
+    _maybe_sweep_staging_async()
+    print(f"[stage-video] id={vid_id} files={written}")
+    return jsonify(id=vid_id, files=written, staged=True, ok=True)
+
+
+@app.post("/stage-video/<vid_id>/discard")
+def discard_staged_video(vid_id):
+    """Apaga um pré-envio não confirmado (card removido / aba fechada). Só
+    mexe em vhash COM marcador e SEM entrada no catálogo."""
+    vid_id = (vid_id or "").strip().lower()
+    if not _is_vhash(vid_id):
+        return jsonify(error="id inválido"), 400
+    marker = STAGING_PREFIX + vid_id
+    if not STORE.exists(marker):
+        return jsonify(ok=True, discarded=False)
+    discarded = False
+    if not _media_in_catalog(vid_id):
+        for k in _clip_keys(vid_id):
+            STORE.delete(k)
+        discarded = True
+    STORE.delete(marker)
+    return jsonify(ok=True, discarded=discarded)
+
+
 @app.post("/upload-video")
 def upload_video():
     """Recebe um clipe já processado no browser:
@@ -4508,6 +4670,7 @@ def upload_video():
       - `video720`  : webm 720p (opcional, audio-only mode)
       - `ttl`       : TTL auto-suficiente com 1 ph:MotionImage e seus metadados
       - `id`        : pHash de vídeo (16 hex)
+      - `staged`    : "1" → os blobs já subiram via /stage-video; só o TTL vem
     Valida com SHACL (MotionImageShape), persiste os arquivos em `clips/<id>.*`
     e mescla os triples em `data/images.ttl` (que serve imagens E vídeos — o
     tipo vem da CLASSE StillImage/MotionImage, não do IRI)."""
@@ -4523,9 +4686,9 @@ def upload_video():
     if not vid_id or len(vid_id) != 16 or not all(c in "0123456789abcdef" for c in vid_id):
         return jsonify(error="id inválido (esperado vhash de 16 hex)"), 400
 
+    staged = (request.form.get("staged") or "").strip().lower() in ("1", "true")
     # Audio é obrigatório (a SHACL MotionImageShape exige ph:audio).
-    audio_file = request.files.get("audio")
-    if not audio_file:
+    if not staged and not request.files.get("audio"):
         return jsonify(error="audio ausente (sempre obrigatório)"), 400
 
     # Valida antes de gravar — evita lixo em disco se o TTL não bate com a id.
@@ -4541,24 +4704,28 @@ def upload_video():
     if not ok:
         return jsonify(error="SHACL violations", details=errors), 422
 
-    # Grava (fora do lock; keys content-addressed pelo vhash — idempotente):
-    # audio.webm sempre; webms só se vieram (audio-only mode); thumb opcional.
-    written = []
-    audio_key = f"clips/{vid_id}.audio.webm"
-    STORE.write_bytes(audio_key, audio_file.read(), content_type="audio/webm")
-    written.append(audio_key)
-    thumb_file = request.files.get("thumb")
-    if thumb_file:
-        thumb_key = f"clips/{vid_id}.thumb.jpg"
-        STORE.write_bytes(thumb_key, thumb_file.read(), content_type="image/jpeg")
-        written.append(thumb_key)
-    for form_field, key_suffix in (("video360", "360p.webm"), ("video720", "720p.webm")):
-        f = request.files.get(form_field)
-        if not f:
-            continue
-        key = f"clips/{vid_id}.{key_suffix}"
-        STORE.write_bytes(key, f.read(), content_type="video/webm")
-        written.append(key)
+    marker = STAGING_PREFIX + vid_id
+    had_marker = STORE.exists(marker)
+    if staged:
+        # Blobs já no servidor (pré-envio): confere que os que o TTL referencia
+        # existem — varridos/perdidos → 409 e o cliente reenvia com os blobs.
+        try:
+            written = _clip_keys_from_ttl(ttl_text, vid_id)
+        except Exception as e:  # noqa: BLE001
+            return jsonify(error=str(e)), 400
+        missing = [k for k in written if not STORE.exists(k)]
+        if missing:
+            return jsonify(error="pré-envio não encontrado no servidor",
+                           code="staging-missing", missing=missing, id=vid_id), 409
+    else:
+        # Grava (fora do lock; keys content-addressed pelo vhash — idempotente):
+        # audio.webm sempre; webms só se vieram (audio-only mode); thumb
+        # opcional. Todos em paralelo.
+        try:
+            written = _write_clip_blobs(vid_id)
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            return jsonify(error=f"gravação dos blobs: {e}", id=vid_id), 500
 
     def _cleanup_orphans():
         # Blobs já gravados sem triples = órfãos invisíveis. Limpa best-effort.
@@ -4592,8 +4759,19 @@ def upload_video():
                   f"vhash colidiu com um phash.", id=vid_id,
         ), 409
 
-    print(f"[upload-video] id={vid_id} files={written}")
-    return jsonify(id=vid_id, files=written, ok=True)
+    if had_marker:
+        # Fecha o pré-envio: some o marcador e qualquer variante pré-enviada
+        # que este upload NÃO referencia (ex.: 720p pré-enviado, HD desligado
+        # antes do Enviar) — senão viraria blob órfão público.
+        try:
+            STORE.delete(marker)
+            for k in _clip_keys(vid_id):
+                if k not in written:
+                    STORE.delete(k)
+        except Exception as e:  # noqa: BLE001
+            print(f"[upload-video] aviso fechando pré-envio de {vid_id}: {e}")
+    print(f"[upload-video] id={vid_id} files={written}{' (pré-enviados)' if staged else ''}")
+    return jsonify(id=vid_id, files=written, ok=True, staged=staged)
 
 
 def remove_video_from_uploads(vhash):
@@ -5127,6 +5305,7 @@ def _warm_caches():
         _load_validator()
         _load_catalog()
         print(f"[warmup] validador + catálogo prontos em {_time.monotonic() - t0:.1f}s")
+        _sweep_staging()
     except Exception as e:  # noqa: BLE001
         print(f"[warmup] falhou (segue lazy): {e}")
 

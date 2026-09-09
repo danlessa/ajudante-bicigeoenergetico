@@ -432,6 +432,24 @@ Key flows:
   what's already on the server (catalog includes both hash sets at boot).
   `upload_videos.html` is a permanent redirect stub to
   `upload_images.html` for bookmarked URLs.
+  **O vídeo é preparado em segundo plano e pré-enviado** (v400): o recorte
+  é identificado por `clipParams(card).key` (início|fim|áudio-só|hd);
+  `ensureProcessed` memoiza o processamento por key em `card.proc` (um
+  `AbortController` cancela o de key diferente em voo) e a preparação
+  ESPECULATIVA (`scheduleSpeculativeTranscode`, debounced) dispara na
+  ativação do card e a cada `change` do recorte/checkboxes; ao terminar,
+  `stageClip` sobe os blobs pra `POST /stage-video/<vhash>` e o Enviar manda
+  só o TTL (`staged=1`) — 409 `staging-missing` faz o cliente reenviar com os
+  blobs. `processClip` escolhe o motor: **WebCodecs** via a `mediabunny`
+  vendorada (`lib/mediabunny.min.mjs`, MPL-2.0, import dinâmico; só quando o
+  browser ENCODA VP9/VP8 + opus — Safari não, cai fora) → `transcodeClip`
+  (MediaRecorder, passe único, tempo real) → sequencial. A miniatura sai do
+  próprio passe (CanvasSink / canvas no primeiro quadro ≥ 5 % do recorte).
+  **720p é opcional por card** (checkbox HD, default = não-touch, persistido
+  em `phidro:uploadHd`); o TTL só emite `ph:video720p`/`"720p"` quando o blob
+  existe — `app.js` já cai pro 360p. `?slow=1` força o MediaRecorder (debug).
+  Testado headless (Chrome, `scratchpad/e2e.mjs`-style): clipe de 8 s
+  preparado+pré-enviado em ~1,5 s, Enviar em 0,3 s.
 - **Validation.** `pyshacl` loads `web/data/shapes.ttl` +
   `web/data/ontology.ttl` once per process. The validator merges the
   incoming TTL with the ontology before checking — `pyshacl`'s `ont_graph`
@@ -560,7 +578,21 @@ Key flows:
   abre no modal da rota — com bloco Google News pros passeios das últimas
   48 h; cache por hash + TTL de 1 h). Ops: `GET /health`, `POST /reload`
   (force re-read of the on-disk TTL catalog after an out-of-band edit).
-  Mutations: `POST /upload-image`, `POST /upload-video`,
+  Mutations: `POST /upload-image`, `POST /upload-video` (`staged=1` = só o
+  TTL, blobs já pré-enviados), `POST /stage-video/<vhash>` (pré-envio dos
+  blobs de um vídeo AINDA não catalogado: grava nas chaves finais
+  `clips/<vhash>.*` em paralelo + marcador `clips/_staging/<vhash>` com o
+  instante; 409 se o vhash já está no catálogo), `POST
+  /stage-video/<vhash>/discard` (apaga um pré-envio não confirmado — só com
+  marcador e sem entrada no catálogo; o form chama via `sendBeacon` ao
+  remover o card / `pagehide`). Pré-envios abandonados são varridos por
+  `_sweep_staging` (boot via `_warm_caches` + 1×/h disparado por
+  `/stage-video`): marcador mais velho que `STAGING_MAX_AGE_S` (6 h) cujo
+  vhash não está no catálogo → blobs + marcador somem; se está, só o
+  marcador. O `/upload-video` que fecha um pré-envio apaga o marcador E as
+  variantes pré-enviadas que o TTL final não referencia (HD desligado depois
+  do pré-envio). Não há auth: o pré-envio expõe os blobs na URL pública do
+  bucket por até 6 h mesmo sem upload — aceito (quem abre o form vai subir).
   `POST /upload-tour` (`mode=replace|patch` + `remove` — see Tour CRUD),
   `POST /delete-image/<phash>`, `POST /delete-video/<vhash>`,
   `POST /delete-tour/<tour_id>`. Rotas salvas (biblioteca do editor de
@@ -712,7 +744,13 @@ writes RDF directly. App.js reads `ph:Video` from `uploads.ttl` only.
   720p, 360p — com a trilha de áudio clonada). MediaRecorder é tempo real:
   os três passes em série custavam 3× a duração do recorte. Falhou (browser
   recusa 3 recorders)? Cai pro sequencial antigo, que fica no arquivo por
-  isso.
+  isso. Acima dos dois está o caminho **WebCodecs** (`transcodeClipFast`,
+  mediabunny — segundos em vez de tempo real); a cadeia mora em
+  `processClip`. Uma mudança no modelo de saída (bitrates, lado curto,
+  codecs) tem que ser feita nos DOIS motores (`VIDEO_BITRATE` é compartilhado).
+- **`/upload-video` grava os blobs em paralelo** (`_write_clip_blobs`,
+  ThreadPoolExecutor — eram 4 round-trips em série no GCS) e lê
+  `request.files` antes de qualquer thread; continua fora do `_state_lock`.
 - **Bump `sw.js` `VERSION`** on *any* change to files in `web/` —
   otherwise the service worker serves stale cached copies and the change
   won't reach users. It's a monotonic `phidro-vN` integer counter; just

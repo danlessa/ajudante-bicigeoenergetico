@@ -1437,7 +1437,9 @@ async function prefillFromId(tourId) {
   // pré-seleciona o select via ?tour=<slug>).
   const mediaBtn = $('#upload-media');
   mediaBtn.addEventListener('click', () => {
-    location.href = `./upload_images.html?tour=${encodeURIComponent(tourId)}`;
+    // Propaga `from=censo` pra que o "← Voltar ao censo" apareça lá também.
+    const fromCenso = new URLSearchParams(location.search).get('from') === 'censo';
+    location.href = `./upload_images.html?tour=${encodeURIComponent(tourId)}${fromCenso ? '&from=censo' : ''}`;
   });
   mediaBtn.hidden = false;
 

@@ -131,6 +131,9 @@
     text-decoration: none;
     border-bottom: 1px solid var(--accent);
   }
+  /* "Editar" + "Subir" lado a lado, sem quebrar a linha da célula. */
+  tbody td a.edit-btn + a.edit-btn { margin-left: 4px; }
+  tbody td.actions { white-space: nowrap; }
   tbody td a.edit-btn:hover {
     background: var(--accent);
     color: #fff;
@@ -307,7 +310,7 @@
         <th data-key="intensityRank" data-num="true">Intensidade</th>
         <th class="col-attendee-list" hidden data-key="attendeeNamesJoined" data-num="false">Participantes</th>
         <th class="col-newcomer-list" hidden data-key="newcomerNamesJoined" data-num="false">Iniciantes</th>
-        <th>Editar</th>
+        <th>Ações</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -356,7 +359,7 @@
           <th class="f" title="ph:measuredEnergy — energia medida (kJ)">kJ med</th>
           <th class="f" title="Fotos e vídeos no amora (images.ttl) — o tier alto, geolocalizado">amora</th>
           <th class="f" title="ph:MediaSweep — o passe de coleta no grupo do zap">passe</th>
-          <th>Editar</th>
+          <th>Ações</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -821,6 +824,10 @@ function renderTable(tours) {
     if (t.iri.startsWith(PAS)) tourId = t.iri.slice(PAS.length);
     else if (t.iri.startsWith(PHD + 'tour_')) tourId = t.iri.slice((PHD + 'tour_').length);
     const editHref = `./upload_tour.html?id=${encodeURIComponent(tourId)}&from=censo`;
+    // "Subir": abre upload_images.html já com o passeio pré-selecionado
+    // (`?tour=<slug>` — o form casa o slug com o IRI do select) e com
+    // `from=censo` pra mostrar o "← Voltar ao censo" lá.
+    const uploadHref = `./upload_images.html?tour=${encodeURIComponent(tourId)}&from=censo`;
     // Mídias: total com breakdown foto/vídeo no title (hover).
     const mediaTitle = isMissing(t.media)
       ? '' : `${t.mediaPhotos} foto(s), ${t.mediaVideos} vídeo(s)`;
@@ -843,7 +850,8 @@ function renderTable(tours) {
         `<td${t.intensity ? '' : ' class="missing"'}>${intensityCell}</td>` +
         `<td class="col-attendee-list"${showLists ? '' : ' hidden'} title="${escapeHtml(t.attendeeNamesJoined)}">${escapeHtml(t.attendeeNamesJoined) || '<span class="muted">—</span>'}</td>` +
         `<td class="col-newcomer-list"${showLists ? '' : ' hidden'} title="${escapeHtml(t.newcomerNamesJoined)}">${escapeHtml(t.newcomerNamesJoined) || '<span class="muted">—</span>'}</td>` +
-        `<td><a class="edit-btn" href="${editHref}" title="Editar este passeio em upload_tour.html">Editar</a></td>` +
+        `<td class="actions"><a class="edit-btn" href="${editHref}" title="Editar este passeio em upload_tour.html">Editar</a>` +
+        `<a class="edit-btn" href="${uploadHref}" title="Enviar fotos e vídeos deste passeio em upload_images.html">Subir</a></td>` +
       `</tr>`
     );
   });
@@ -925,7 +933,7 @@ function renderCaptura(tours) {
     const n = t.mediaPhotos + t.mediaVideos;
     cels.push(n > 0
       ? `<td class="f"><span class="sweep-n" title="${n} mídias no amora">${n}</span></td>`
-      : `<td class="f"><a class="dot gap" href="./upload_images.html"
+      : `<td class="f"><a class="dot gap" href="./upload_images.html?tour=${encodeURIComponent(slugOf(t.iri))}&from=censo"
            title="nenhuma mídia no amora — clique pra enviar">✗</a></td>`);
     // Passe de coleta — três estados bem distintos.
     if (!t.sweep) {
@@ -940,7 +948,9 @@ function renderCaptura(tours) {
         + (t.sweep.pasta ? `\n${t.sweep.pasta}` : '');
       cels.push(`<td class="f"><span class="sweep-n" title="${escapeHtml(ttl)}">${t.sweep.arquivos}</span></td>`);
     }
-    cels.push(`<td><a class="edit-btn" href="./upload_tour.html?id=${encodeURIComponent(slugOf(t.iri))}&from=censo">Editar</a></td>`);
+    const slug = encodeURIComponent(slugOf(t.iri));
+    cels.push(`<td class="actions"><a class="edit-btn" href="./upload_tour.html?id=${slug}&from=censo">Editar</a>`
+      + `<a class="edit-btn" href="./upload_images.html?tour=${slug}&from=censo" title="Enviar fotos e vídeos deste passeio">Subir</a></td>`);
     tr.innerHTML = cels.join('');
     tb.appendChild(tr);
   }
