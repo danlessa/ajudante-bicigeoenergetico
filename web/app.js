@@ -1788,7 +1788,10 @@ async function loadClipsCatalog() {
 // ficam ausentes — o app renderiza só como fonte sonora (audio loop), não
 // como ghost-video no mapa.
 async function loadClipsFromUploadsTtl() {
-  const res = await fetch('./data/images.ttl', { cache: 'no-cache' });
+  // images-geo.ttl = só a mídia com coordenada (view derivada do backend) —
+  // clipes sem geo nunca entram no mapa (ver o filtro abaixo), então o dump
+  // completo, que cresce com o acervo do WhatsApp, não precisa vir aqui.
+  const res = await fetch('./data/images-geo.ttl', { cache: 'no-cache' });
   if (!res.ok) return [];
   const text = await res.text();
   if (!text.trim()) return [];
@@ -2599,6 +2602,11 @@ async function loadAllGraphs() {
     // Manifesto vivo — baixa TODOS os arquivos listados em PARALELO (eram N
     // round trips em série, cada um um request no Cloud Run: ~0,25 s a mais
     // por carga/reload em produção) e parseia na ordem do manifesto.
+    // O manifesto lista o images.ttl COMPLETO (é o que a galeria, o censo e
+    // os agentes querem); o mapa só usa mídia georreferenciada, então troca
+    // pela view derivada images-geo.ttl (backend) — o dump inteiro cresce
+    // ~10× com o acervo do WhatsApp e tudo isso seria parseado e descartado.
+    m.urls = m.urls.map((u) => u.replace(/\/data\/images\.ttl$/, '/data/images-geo.ttl'));
     const allQuads = [];
     const parts    = [];
     const texts = await Promise.all(m.urls.map((u) =>
@@ -3153,7 +3161,7 @@ function applyMediaFilter(patch) {
     window.PhidroMediaQuery.queryMediaIris(mediaStore, mediaFilter.query)
       .then((set) => {
         mediaFilterResultSet = set;
-        if (errBox) errBox.textContent = `${set.size} mídia(s).`;
+        if (errBox) errBox.textContent = `${set.size} mídia(s) no mapa.`;
         applyPhotoVisibility();
         renderMediaFilterChip();
       })
@@ -3649,21 +3657,31 @@ const uploadBtn        = document.getElementById('upload-btn');
 const uploadModal      = document.getElementById('upload-modal');
 const uploadIframe     = document.getElementById('upload-iframe');
 let _uploadDirty = false;   // o form avisou (phidro-media-changed) que salvou/editou algo
-function openUploadModal() {
+// `page` escolhe o form dentro do MESMO iframe/modal: o completo
+// (upload_images.html, default — menu Ações e ✎ Editar dos popups) ou o
+// simplificado (`subir`, botão ⬆ da barra). Os dois avisam o app por
+// postMessage (phidro-media-changed), então o reload ao fechar é o mesmo.
+function openUploadModal(page = 'upload_images.html') {
   if (!uploadModal) return;
   closeOtherMobileDialogs('upload');
   // Lazy-load: só seta o src na 1ª abertura (depois mantém o estado do form).
   // NB: `iframe.src` (IDL) é truthy mesmo quando o atributo está vazio
   // (devolve a URL da página pai/`about:blank`). Checamos o atributo cru.
-  if (!uploadIframe.getAttribute('src')) {
-    uploadIframe.src = './upload_images.html';
+  // Trocar de form (completo ↔ simplificado) recarrega o iframe — o estado do
+  // outro form se perde, por construção.
+  const cur = uploadIframe.getAttribute('src') || '';
+  const want = './' + page;
+  if (!cur || cur.split('?')[0] !== want) {
+    uploadIframe.src = want;
   }
   uploadModal.hidden = false;
   uploadBtn?.setAttribute('aria-pressed', 'true');
+  subirImagensBtn?.setAttribute('aria-pressed', String(page === 'subir'));
 }
 function closeUploadModal() {
   if (uploadModal) uploadModal.hidden = true;
   uploadBtn?.setAttribute('aria-pressed', 'false');
+  subirImagensBtn?.setAttribute('aria-pressed', 'false');
   // Pede pro upload_images.html limpar os cards — evita acumular fotos já
   // enviadas (ou abandonadas) entre uma abertura e outra do modal.
   try {
@@ -3674,7 +3692,16 @@ function closeUploadModal() {
   // rebuild de todos os marcadores.
   if (_uploadDirty) { _uploadDirty = false; reloadPhotos(); }
 }
-uploadBtn?.addEventListener('click', openUploadModal);
+uploadBtn?.addEventListener('click', () => openUploadModal());
+// ⬆ subir imagens (barra): o envio simplificado (/subir) no mesmo modal.
+const subirImagensBtn = document.getElementById('subir-imagens-btn');
+subirImagensBtn?.addEventListener('click', () => {
+  if (uploadModal && !uploadModal.hidden && subirImagensBtn.getAttribute('aria-pressed') === 'true') {
+    closeUploadModal();
+    return;
+  }
+  openUploadModal('subir');
+});
 // Clique no overlay (fora do conteúdo) fecha.
 uploadModal?.addEventListener('click', (e) => {
   if (e.target === uploadModal) closeUploadModal();
@@ -3885,10 +3912,12 @@ document.getElementById('subir-censo')?.addEventListener('click', () => {
   closeSubirModal();
   openCensoModal();
 });
-document.getElementById('subir-memoria')?.addEventListener('click', () => {
-  // Virou um <a href> de verdade (link rastreável pra indexação): o navegador
-  // abre a aba nova sozinho — aqui só fecha o modal.
+// 🖼 Galeria saiu da barra de cima (v403) e mora aqui; a Memória fez o
+// caminho inverso (é o <a id="memoria-btn"> da barra — o navegador abre a
+// aba sozinho, sem JS).
+document.getElementById('subir-imagens-galeria')?.addEventListener('click', () => {
   closeSubirModal();
+  openImagensModal();
 });
 document.getElementById('subir-custos')?.addEventListener('click', () => {
   closeSubirModal();
@@ -3907,6 +3936,11 @@ document.getElementById('subir-help')?.addEventListener('click', () => {
   closeSubirModal();
   closeOtherMobileDialogs('help');
   setHelpOpen(true);
+});
+// ⚙ Ajustes saiu da barra de cima (v402) e mora aqui; o modal é o mesmo.
+document.getElementById('subir-settings')?.addEventListener('click', () => {
+  closeSubirModal();
+  openSettings();
 });
 
 // ─── Botão de fechar (bolinha vermelha estilo macOS) ─────────────────────────

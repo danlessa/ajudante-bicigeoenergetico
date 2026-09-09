@@ -2377,6 +2377,72 @@ def media_page(local):
                                 headers={"Cache-Control": "no-cache"}))
 
 
+# ── images-geo.ttl: a fatia GEORREFERENCIADA do catálogo de mídia ────────
+# O mapa (app.js) só usa mídia com coordenada: baixava e parseava o images.ttl
+# INTEIRO duas vezes por boot e jogava fora tudo o que não tem
+# schema:locationCreated. Com a ingestão do acervo do WhatsApp (~7.500 fotos
+# sem GPS, que nunca viram marcador) o dump completo cresce ~10× e o boot
+# pagaria isso por nada. Esta view derivada tem só: mídia georreferenciada +
+# seus nós derivados `<iri>_*` (geo/hash) + a closure de bnodes legados + os
+# `env:` ph:Upload que a geraram (o popup mostra o envio). É DERIVADA e NUNCA
+# vai pro bucket — nada de sync; cache por digest do texto do images.ttl (o
+# mesmo padrão do _tours_graph), refeita depois de cada commit. A galeria,
+# o censo, pessoas.html e memoria.html seguem no images.ttl completo.
+_images_geo_cache = {"digest": None, "text": None}
+_images_geo_lock = threading.Lock()
+
+
+def _images_geo_text():
+    import hashlib
+    from collections import defaultdict
+    from rdflib import RDF, URIRef, BNode
+    full = _load_dump_text("images.ttl") or ""
+    digest = hashlib.sha1(full.encode("utf-8")).hexdigest()
+    with _images_geo_lock:
+        if _images_geo_cache["digest"] == digest:
+            return _images_geo_cache["text"]
+    Graph = _load_validator()["Graph"]
+    cat = _load_catalog()                     # snapshot imutável — fora do lock
+    media_types = (URIRef(PH_NS + "StillImage"), URIRef(PH_NS + "MotionImage"))
+    loc = URIRef(SCHEMA_NS + "locationCreated")
+    generated = URIRef("http://www.w3.org/ns/prov#generated")
+    roots = {s for s in cat.subjects(loc, None)
+             if any((s, RDF.type, t) in cat for t in media_types)}
+    roots |= {s for s in cat.subjects(RDF.type, URIRef(PH_NS + "GeoreferencedImage"))
+              if any((s, RDF.type, t) in cat for t in media_types)}
+    # Nós derivados `<root>_geo|_hash`, indexados uma vez (o _derived_subjects
+    # por raiz seria O(raízes × sujeitos)).
+    derived = defaultdict(set)
+    for s in set(cat.subjects()):
+        if isinstance(s, URIRef) and "_" in str(s).rsplit("/", 1)[-1]:
+            derived[URIRef(str(s).rsplit("_", 1)[0])].add(s)
+    out = Graph()
+    for pfx, ns in cat.namespaces():
+        out.bind(pfx, ns)
+    seen_bnodes = set()
+    def _copia(subj):
+        for s, p, o in cat.triples((subj, None, None)):
+            out.add((s, p, o))
+            if isinstance(o, BNode) and o not in seen_bnodes:
+                seen_bnodes.add(o)
+                for t in cat.triples((o, None, None)):
+                    out.add(t)
+    for r in roots:
+        _copia(r)
+        for d in derived.get(r, ()):
+            _copia(d)
+        for act in cat.subjects(generated, r):
+            _copia(act)
+    # A licença do dump, como no images.ttl.
+    for t in cat.triples((URIRef(f"{PUBLIC_BASE_URL or 'https://amora.pedalhidrografi.co'}/data/images.ttl"), None, None)):
+        out.add(t)
+    text = out.serialize(format="turtle")
+    with _images_geo_lock:
+        _images_geo_cache["digest"] = digest
+        _images_geo_cache["text"] = text
+    return text
+
+
 @app.get("/data/<filename>")
 def get_data_ttl(filename):
     """Handler único pra /data/*.ttl — bucket-first, container fallback.
@@ -2402,7 +2468,10 @@ def get_data_ttl(filename):
     # IsADirectoryError → 500 feio. Só servimos *.ttl de nome simples.
     if not filename.endswith(".ttl") or "/" in filename or ".." in filename:
         abort(404)
-    text = _load_dump_text(filename)
+    if filename == "images-geo.ttl":
+        text = _images_geo_text()
+    else:
+        text = _load_dump_text(filename)
     if text is None:
         if filename in ("images.ttl", "identities.ttl", "uploads.ttl", "lists.ttl"):
             text = ""             # catálogo vazio — válido (uploads.ttl: legado)
@@ -3441,7 +3510,7 @@ def _build_sitemap_xml(tours_text):
     # Memória Hidrográfica — a linha do tempo muda junto com o catálogo,
     # então o lastmod é a data do passeio mais recente.
     memoria = ["  <url>",
-               f"    <loc>{escape(SITE_URL)}memoria.html</loc>"]
+               f"    <loc>{escape(SITE_URL)}memoria</loc>"]
     newest = next((dt for dt, _, _ in tours if dt), None)
     if newest:
         memoria.append(f"    <lastmod>{newest.date().isoformat()}</lastmod>")
@@ -3591,7 +3660,7 @@ def _render_tour_index(tour_id):
     if authors:
         a.append(f"  <p>Alguns elaboradores: {h(', '.join(authors))}</p>")
     a.append(f'  <p><a href="{h(SITE_URL)}">← mapa do Pedal Hidrográfico</a> · '
-             f'<a href="{h(SITE_URL)}memoria.html#{h(tour_id)}">este passeio na '
+             f'<a href="{h(SITE_URL)}memoria#{h(tour_id)}">este passeio na '
              "Memória Hidrográfica</a></p>")
     a.append("</article>")
     article = "\n".join(a)
@@ -3865,7 +3934,7 @@ def _render_tour_markdown(tour_id):
             f"- **IRI:** `{d['iri']}`",
             f"- **RDF (Turtle):** [{d['page_url']}?format=ttl]({d['page_url']}?format=ttl)"
             " — ou `Accept: text/turtle` na mesma URL",
-            f"- [Este passeio na Memória Hidrográfica]({SITE_URL}memoria.html#{d['id']})",
+            f"- [Este passeio na Memória Hidrográfica]({SITE_URL}memoria#{d['id']})",
             f"- [Mapa do Pedal Hidrográfico]({SITE_URL})", ""]
     return "\n".join(out)
 
@@ -3890,7 +3959,7 @@ def _render_home_markdown():
         out.append(f"- [{_md_inline(d['title'])}]({d['page_url']}) — {_tour_md_meta_line(d)}")
     if tours:
         out += ["", f"Todos os {len(tours)} passeios, com narrativa: "
-                    f"[Memória Hidrográfica]({SITE_URL}memoria.html) "
+                    f"[Memória Hidrográfica]({SITE_URL}memoria) "
                     "(também em Markdown com `Accept: text/markdown`)."]
     else:
         out.append("(catálogo de passeios indisponível no momento)")
@@ -4123,7 +4192,7 @@ def _html_shell_markdown(p):
             "Markdown traz o mesmo guia + os passeios recentes)",
             f"- [data_graphs.ttl]({SITE_URL}data/data_graphs.ttl) — manifesto VoID com "
             "todos os dumps RDF",
-            f"- [Memória Hidrográfica]({SITE_URL}memoria.html) — todos os passeios com "
+            f"- [Memória Hidrográfica]({SITE_URL}memoria) — todos os passeios com "
             "narrativa (também em Markdown)",
             f"- [openapi.json]({SITE_URL}openapi.json) — descrição da API HTTP", ""]
     return "\n".join(out)
@@ -4276,6 +4345,17 @@ def _render_memoria_markdown():
 
 
 @app.get("/memoria.html")
+def memoria_legacy():
+    """A Memória mora em /memoria (v404; canônica, sitemap, links internos).
+    O .html antigo redireciona PERMANENTEMENTE, preservando a query; o
+    fragmento (#<slug8> das âncoras por passeio) o navegador carrega sozinho.
+    Navegação via SW: o fetch em modo 'manual' devolve opaqueredirect (não
+    cacheável), o navegador segue — mesmo caminho dos 303 de ?tour=."""
+    qs = request.query_string.decode("utf-8", errors="replace")
+    return redirect("/memoria" + (f"?{qs}" if qs else ""), code=301)
+
+
+@app.get("/memoria")
 def memoria_page():
     """memoria.html com a linha do tempo pré-renderizada — best-effort:
     qualquer falha degrada pro arquivo estático (a página compõe tudo
@@ -4294,6 +4374,16 @@ def memoria_page():
         return web_files("memoria.html")
     return _negotiated(Response(html_text, mimetype="text/html",
                                 headers={"Cache-Control": "no-cache"}))
+
+
+@app.get("/subir")
+def subir_page():
+    """Envio SIMPLIFICADO de fotos (web/subir.html): só autora (opcional) +
+    fotos, que sobem ao serem escolhidas — sem botão Enviar. Tudo o mais é o
+    default do upload_images.html (mesmo POST /upload-image). O caminho curto
+    /subir é a URL que circula no grupo; o mesmo arquivo responde em
+    /subir.html pelo handler estático."""
+    return web_files("subir.html")
 
 
 @app.get("/<path:p>")

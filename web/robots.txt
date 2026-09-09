@@ -13,10 +13,13 @@ Allow: /
 Allow: /data/data_graphs.ttl
 Allow: /data/tours.ttl
 Allow: /data/images.ttl
+Allow: /data/images-geo.ttl
 Allow: /data/identities.ttl
 Disallow: /upload_images.html
 Disallow: /upload_tour.html
 Disallow: /upload_videos.html
+Disallow: /subir
+Disallow: /subir.html
 Disallow: /data/
 Disallow: /photos/
 Disallow: /clips/

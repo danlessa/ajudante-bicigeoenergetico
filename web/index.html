@@ -151,10 +151,12 @@
       <input type="file" id="photos-import-input" accept=".ttl,.zip,text/turtle,application/zip" hidden />
       <input type="file" id="edit-gpx-input" accept=".gpx,application/gpx+xml" hidden />
       <button id="subir-btn" type="button" class="secondary-btn" title="Ações" aria-label="Ações">☰ ações</button>
+      <button id="subir-imagens-btn" type="button" class="secondary-btn" title="Enviar imagens (envio simplificado)" aria-label="Enviar imagens" aria-pressed="false">📤 enviar imgs</button>
       <button id="trace-btn" type="button" class="secondary-btn" title="Traçar GPX" aria-label="Traçar GPX">🗺︎ traçar</button>
-      <button id="imagens-btn" type="button" class="secondary-btn" title="Galeria de imagens e vídeos" aria-label="Galeria de imagens" aria-pressed="false">🖼 imagens</button>
+      <!-- <a> de verdade (não button): a Memória é uma página própria e
+           indexável — link rastreável por crawlers (veio do menu Ações). -->
+      <a id="memoria-btn" class="secondary-btn" href="./memoria" target="_blank" rel="noopener" title="Memória Hidrográfica (abre em aba nova)">🕰 memória</a>
       <span class="topbar-break" aria-hidden="true"></span>
-      <button id="settings-btn" type="button" class="secondary-btn" title="Configurações" aria-label="Configurações">⚙ ajustes</button>
       <button id="layers-btn" type="button" class="secondary-btn" title="Mostrar/ocultar camadas" aria-label="Mostrar/ocultar camadas" aria-pressed="true">⧉ camadas</button>
       </nav>
     </header>
@@ -220,6 +222,31 @@
           <details class="help-changelog">
             <summary>Novidades (changelog)</summary>
             <dl>
+              <dt>09/09/2026 · v404</dt>
+              <dd>
+                <ul>
+                  <li><strong>A Memória Hidrográfica agora mora em <a href="./memoria" target="_blank" rel="noopener">/memoria</a></strong> (endereço curto; o antigo <code>memoria.html</code> redireciona, âncoras por passeio incluídas). O botão da barra encurtou pra <strong>📤 enviar imgs</strong>.</li>
+                </ul>
+              </dd>
+              <dt>09/09/2026 · v403</dt>
+              <dd>
+                <ul>
+                  <li><strong>Barra de cima reorganizada:</strong> o botão de envio virou <strong>📤 enviar imagens</strong>; a galeria <strong>🖼 imagens</strong> saiu da barra e mora no menu <strong>☰ Ações</strong> (como "Galeria de imagens"); no lugar dela entrou <strong>🕰 memória</strong>, que abre a Memória Hidrográfica em aba nova. O item do menu que abre o formulário completo passou a se chamar "Enviar imagens (formulário completo)".</li>
+                </ul>
+              </dd>
+              <dt>09/09/2026 · v402</dt>
+              <dd>
+                <ul>
+                  <li><strong>Envio simplificado em <a href="./subir" target="_blank" rel="noopener">/subir</a>:</strong> só autora (opcional) e as imagens — fotos, vídeos ou artes; escolheu, subiu, sem botão Enviar. Data, lugar e passeio saem do próprio arquivo (EXIF ou metadados do vídeo); vídeo vai inteiro, sem recorte. O resto (licença CC BY-SA 4.0, original preservado, dedup) segue o padrão do formulário completo, e cada imagem enviada ganha ✎ editar / 🗑 excluir ali mesmo.</li>
+                  <li><strong>Barra de cima:</strong> novo botão <strong>⬆ subir imagens</strong> (abre o envio simplificado num modal) antes do Traçar; o <strong>⚙ Ajustes</strong> saiu da barra e mora no menu <strong>☰ Ações</strong>.</li>
+                </ul>
+              </dd>
+              <dt>09/09/2026 · v401</dt>
+              <dd>
+                <ul>
+                  <li><strong>Mapa abre leve mesmo com o acervo inteiro:</strong> o app passa a carregar só a mídia georreferenciada (<code>/data/images-geo.ttl</code>, uma fatia derivada do catálogo) — o catálogo completo, que vai crescer ~10× com as fotos do WhatsApp (memória do passeio, sem marcador), continua na galeria, no censo e nos dumps pra agentes.</li>
+                </ul>
+              </dd>
               <dt>09/09/2026 · v400</dt>
               <dd>
                 <ul>
@@ -1607,7 +1634,7 @@
       </div>
     </div>
 
-    <!-- Settings modal (gear ⚙ no topbar): tabs ao lado esquerdo, conteúdo à direita -->
+    <!-- Settings modal (⚙ Ajustes no menu ☰ Ações; saiu da barra de cima na v402): tabs ao lado esquerdo, conteúdo à direita -->
     <div id="settings-modal" class="modal" hidden>
       <div class="modal-content settings-modal-content">
         <header>
@@ -1884,15 +1911,14 @@
           <button class="close" id="subir-modal-close" type="button" aria-label="Fechar">&times;</button>
         </header>
         <div class="subir-modal-body">
-          <button type="button" id="subir-upload-media" class="subir-action">📤 Enviar fotos/vídeos</button>
+          <button type="button" id="subir-upload-media" class="subir-action">🗂 Enviar imagens (formulário completo)</button>
           <button type="button" id="subir-new-tour" class="subir-action">🚵 Cadastrar passeio</button>
+          <button type="button" id="subir-imagens-galeria" class="subir-action">🖼 Galeria de imagens</button>
           <button type="button" id="subir-censo" class="subir-action">📊 Censo hidrográfico</button>
-          <!-- <a> de verdade (não button): link rastreável por crawlers — a
-               Memória é uma página própria e indexável. -->
-          <a id="subir-memoria" class="subir-action" href="./memoria.html" target="_blank" rel="noopener">🕰 Memória</a>
           <button type="button" id="subir-custos" class="subir-action">💸 Custos</button>
           <button type="button" id="subir-download-gpx" class="subir-action">📥 Baixar rotas (GPX)</button>
           <button type="button" id="subir-share-loc" class="subir-action">📍 Compartilhar localização</button>
+          <button type="button" id="subir-settings" class="subir-action">⚙ Ajustes</button>
           <button type="button" id="subir-help" class="subir-action">❓ Ajuda</button>
         </div>
       </div>

@@ -1,0 +1,735 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="description" content="Envio simplificado de imagens (fotos, vídeos, artes) pro acervo do Pedal Hidrográfico: só autora (opcional) e as imagens — sobem sozinhas ao escolher; data, GPS e passeio saem do próprio arquivo.">
+<title>Subir imagens — Pedal Hidrográfico</title>
+<link rel="stylesheet" href="./fonts/fonts.css">
+<style>
+  /* Paleta espelhada do app (style.css) — mesma do upload_images.html. */
+  :root {
+    --bg: #fafbfc; --panel: #ffffff; --surface: #eef1f4;
+    --text: #101820; --muted: #4a5867;
+    --accent: #c2410c; --accent-hover: #9a3412; --border: #c6ced6;
+    --ok: #1a7f4b; --warn: #9c6a10; --err: #b3261e;
+  }
+  html { color-scheme: light; }
+  body {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    max-width: 640px; margin: 0 auto; padding: 1rem 1rem 3rem;
+    color: var(--text); background: var(--bg);
+  }
+  h1 { font-size: 1.4rem; margin: .5rem 0 .25rem; }
+  p.lede { color: var(--muted); margin: 0 0 1.25rem; font-size: .9rem; line-height: 1.4; }
+  a { color: var(--accent); }
+  label.field { display: block; margin: 0 0 1rem; font-size: .9rem; }
+  label.field span { display: block; margin-bottom: .3rem; }
+  label.field small { color: var(--muted); font-size: .8rem; }
+  input[type="text"] {
+    width: 100%; padding: .6rem; box-sizing: border-box; font-size: 1rem; font-family: inherit;
+    background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+  }
+  input::placeholder { color: var(--muted); }
+  input:focus { outline: none; border-color: var(--accent); }
+  /* O seletor é o botão principal: grande, laranja, alvo de toque confortável
+     — a página existe pra ser usada no celular, direto do grupo. */
+  .picker {
+    display: flex; align-items: center; justify-content: center; gap: .5rem;
+    width: 100%; box-sizing: border-box; padding: 1.1rem 1rem; margin: 0 0 .75rem;
+    font-size: 1.1rem; font-weight: 600; cursor: pointer;
+    background: var(--accent); color: #201206; border: 1px solid var(--accent); border-radius: 8px;
+    user-select: none;
+  }
+  .picker:hover, .picker:focus-within { background: var(--accent-hover); border-color: var(--accent-hover); }
+  .picker.busy { opacity: .6; cursor: progress; }
+  .picker input { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; }
+  #status { min-height: 1.2em; font-size: .85rem; color: var(--muted); margin: 0 0 .75rem; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  /* Grade de miniaturas: uma célula por imagem, com o estado embaixo. */
+  #grid { list-style: none; margin: 0; padding: 0; display: grid; gap: .5rem;
+    grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); }
+  #grid li { display: flex; flex-direction: column; gap: .25rem; min-width: 0; }
+  #grid .th { position: relative; }
+  #grid img, #grid .noimg {
+    display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 6px;
+    border: 2px solid var(--border); background: var(--surface); box-sizing: border-box;
+  }
+  /* Vídeo: selo ▶ no canto (mesmo laranja-avermelhado do .photo-dot-video do mapa). */
+  #grid .badge { position: absolute; right: .3rem; bottom: .3rem; font-size: .7rem; line-height: 1;
+    padding: .15rem .3rem; border-radius: 4px; background: rgba(16,24,32,.75); color: #fff; }
+  #grid li.is-ok img { border-color: var(--ok); }
+  #grid li.is-err img, #grid li.is-err .noimg { border-color: var(--err); }
+  #grid li.is-dup img { border-color: var(--warn); opacity: .6; }
+  #grid li.is-busy img { border-color: var(--accent); }
+  #grid .st { font-size: .7rem; line-height: 1.25; color: var(--muted); overflow-wrap: anywhere; }
+  #grid .nm { font-size: .65rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  /* ✎ editar / 🗑 excluir — só depois do envio (como no popup do mapa e na galeria). */
+  #grid .acts { display: flex; gap: .25rem; }
+  #grid .acts button {
+    flex: 1; padding: .2rem 0; font: inherit; font-size: .75rem; cursor: pointer;
+    background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 4px;
+  }
+  #grid .acts button:hover { border-color: var(--accent); color: var(--accent); }
+  #grid .acts button.danger:hover { border-color: var(--err); color: var(--err); }
+  #grid .acts button[disabled] { opacity: .45; cursor: not-allowed; }
+  .foot { margin-top: 2rem; font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body>
+
+<h1>Subir imagens</h1>
+<p class="lede">Fotos, vídeos ou artes: escolha e pronto — sobem sozinhas. Data, lugar
+e passeio saem do próprio arquivo. Licença CC BY-SA 4.0, original preservado.</p>
+
+<label class="field" for="author">
+  <span>Autora <small>(opcional — quem fez a imagem)</small></span>
+  <input type="text" id="author" list="people" autocomplete="off"
+         placeholder="seu nome ou apelido">
+</label>
+<datalist id="people"></datalist>
+
+<label class="picker" id="picker">
+  <span aria-hidden="true">📷</span> Escolher imagens
+  <input type="file" id="files" accept="image/*,video/*" multiple>
+</label>
+<p id="status">carregando catálogo…</p>
+
+<ul id="grid"></ul>
+
+<p class="foot">Precisa ajustar passeio, data, lugar ou recortar um vídeo?
+  Use o <a href="./upload_images.html">formulário completo</a>. · <a href="./">Voltar ao mapa</a></p>
+
+<script type="module">
+// ============================================================================
+// /subir — envio SIMPLIFICADO de imagens (fotos, vídeos, artes). Dois campos:
+// autora (opcional) e as imagens; escolher = enviar. Tudo o mais é o default
+// do formulário completo (upload_images.html):
+//   foto  — licença CC BY-SA 4.0, sem anonimizar, original preservado bit a
+//           bit (large/thumb derivados como lá), data/GPS/direção/focal do
+//           EXIF, passeio auto-detectado pela data (−2 h / +12 h);
+//   vídeo — clipe inteiro (sem recorte), áudio embutido + audio.webm à parte,
+//           360p sempre, 720p só em aparelho sem toque (default do form),
+//           data/GPS do moov (Apple), passeio pela data; sem pré-envio
+//           (/stage-video) — o POST /upload-video vai com os blobs.
+// Dedup por pHash/vHash (Hamming ≤ 5) contra o lote, a sessão E o servidor.
+// O pipeline (pHash, variantes, transcodificação…) vem de lib/media-pipeline.js,
+// cópia verbatim do formulário completo.
+// ============================================================================
+import {
+  localToXsdDateTime, computePHash, computeVideoPHash, compressToTarget, makeThumbnail,
+  copyExifSegment, hammingDistance, isHeicFile, isVideoFile,
+  tryExtractVideoGps, tryExtractVideoCreationDate, videoFirstFrameBlob,
+  probeVideoDuration, processClipFile, isAbortError, makeLimiter,
+} from './lib/media-pipeline.js';
+
+const $ = (sel, root = document) => root.querySelector(sel);
+
+// Embutido no iframe do app: o título vive na faixa do header do modal —
+// esconde o <h1> pra não duplicar (mesmo padrão do upload_images.html). O app
+// avisa ao fechar o modal (phidro-upload-modal-closed): limpa a grade, pra
+// não acumular imagens já enviadas entre uma abertura e outra.
+const EMBEDDED = window.self !== window.top;
+let pickerBusy = false;   // lote em curso (declarado cedo: o listener abaixo lê)
+if (EMBEDDED) $('h1')?.style.setProperty('display', 'none');
+window.addEventListener('message', (e) => {
+  if (e.origin !== location.origin || e.data?.type !== 'phidro-upload-modal-closed') return;
+  if (!pickerBusy) { $('#grid').innerHTML = ''; }
+});
+
+// Seleção feita antes do boot terminar (imports + catálogo) — guarda e o
+// listener real processa quando estiver pronto (mesmo padrão do form completo).
+window._phidroEarlyPicks = [];
+$('#files').addEventListener('change', (e) => {
+  if (!window._phidroEarlyPicks) return;
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (files.length) window._phidroEarlyPicks.push(files);
+});
+
+// ===================== Dependências =====================================
+let exifr = null;
+try {
+  exifr = await import('./lib/exifr.esm.js').then(m => m.default || m);
+} catch (e) { console.warn('exifr indisponível:', e); }
+
+function _loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = () => resolve(); s.onerror = () => reject(new Error(`falha ao carregar ${src}`));
+    document.head.appendChild(s);
+  });
+}
+let _n3P = null;
+function n3Parser() {
+  return _n3P ||= (window.N3 ? Promise.resolve() : _loadScript('./lib/n3.min.js'))
+    .then(() => window.N3.Parser);
+}
+// heic2any: só pra Chrome/Firefox (Safari decodifica HEIC nativo). Import
+// não-bloqueante, memoizado por promise.
+let heic2any = null, _heicP = null;
+function heic2anyReady() {
+  return _heicP ||= import('https://esm.sh/heic2any@0.0.4')
+    .then(m => { heic2any = m.default; return heic2any; })
+    .catch(() => { console.warn('heic2any indisponível — HEIC só no Safari.'); return null; });
+}
+if (!/^((?!chrome|android).)*safari/i.test(navigator.userAgent)) heic2anyReady();
+
+// ===================== Helpers básicos ==================================
+function turtle_escape(s) {
+  return (s || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
+}
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+function pad(n) { return String(n).padStart(2, '0'); }
+function dateToLocalInput(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` +
+         `T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+function plural(n, one, many) { return `${n} ${n === 1 ? one : many}`; }
+
+// ===================== Catálogo (passeios + pessoas + hashes) ============
+const PH_NS    = 'https://id.pedalhidrografi.co/terms#';
+const PES_NS   = 'https://id.pedalhidrografi.co/pessoas/';
+const MED_NS   = 'https://id.pedalhidrografi.co/midia/';
+const SCHEMA   = 'https://schema.org/';
+const RDF_TYPE = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
+const DCT_DATE = 'http://purl.org/dc/terms/date';
+const DCT_TITLE = 'http://purl.org/dc/terms/title';
+
+const TOUR_WINDOW_BEFORE_MS =  2 * 3600 * 1000;
+const TOUR_WINDOW_AFTER_MS  = 12 * 3600 * 1000;
+const COMPRESS_TARGET_BYTES = 500 * 1024;
+const PHASH_DUP_THRESHOLD   = 5;
+const LICENSE = 'https://creativecommons.org/licenses/by-sa/4.0/';
+const AUTHOR_KEY = 'phidro:subirAutora';
+// 720p só em aparelho sem toque — o mesmo default do checkbox HD do form
+// completo (celular transcoda devagar e quase nunca precisa do HD).
+const WANT_HD = (() => { try { return !matchMedia('(pointer: coarse)').matches; } catch (_) { return true; } })();
+
+const tourCatalog = [];         // { iri, ms, title }
+const personByName = new Map(); // nome normalizado → iri (apelido E nome real)
+const existingPhashes = [];     // fotos no servidor + as que subiram nesta sessão
+const existingVhashes = [];     // vídeos idem
+
+function normName(s) {
+  return s.normalize('NFKD').replace(/\p{Diacritic}/gu, '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+async function loadCatalog() {
+  const Parser = await n3Parser();
+  const URLS = ['./data/tours.ttl', './data/images.ttl', './data/identities.ttl'];
+  const texts = await Promise.all(URLS.map(url =>
+    fetch(url).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.text(); })
+      .catch(e => { console.warn(`Catálogo: ${url} indisponível —`, e.message); return null; })));
+  const types = new Map(), titles = new Map(), dts = new Map(), names = new Map();
+  for (const text of texts) {
+    if (text == null) continue;
+    try {
+      for (const q of new Parser().parse(text)) {
+        const s = q.subject.value, p = q.predicate.value, o = q.object.value;
+        if (p === RDF_TYPE) { if (!types.has(s)) types.set(s, new Set()); types.get(s).add(o); }
+        else if (p === DCT_TITLE) titles.set(s, o);
+        else if (p === DCT_DATE)  dts.set(s, o.slice(0, 16));
+        else if (p === SCHEMA + 'alternateName' || p === SCHEMA + 'name') {
+          if (!names.has(s)) names.set(s, []);
+          names.get(s).push(o);
+        }
+      }
+    } catch (e) { console.warn('Catálogo: parse falhou —', e.message); }
+  }
+  let nPersons = 0, nTours = 0;
+  const datalist = $('#people');
+  const seenLabels = new Set();
+  for (const [s, ts] of types) {
+    if (s.startsWith(MED_NS)) {
+      const h = s.slice(MED_NS.length).toLowerCase();
+      if (/^[0-9a-f]{16}$/.test(h)) {
+        if (ts.has(PH_NS + 'StillImage')) existingPhashes.push(h);
+        else if (ts.has(PH_NS + 'MotionImage')) existingVhashes.push(h);
+      }
+    }
+    if (ts.has(PH_NS + 'Tour')) {
+      const ms = new Date(dts.get(s) || '').getTime();
+      if (!isNaN(ms)) tourCatalog.push({ iri: s, ms, title: titles.get(s) || s });
+      nTours++;
+    }
+    if (ts.has(SCHEMA + 'Person')) {
+      nPersons++;
+      for (const n of names.get(s) || []) {
+        const k = normName(n);
+        if (k && !personByName.has(k)) personByName.set(k, s);
+        if (n && !seenLabels.has(n)) {
+          seenLabels.add(n);
+          const opt = document.createElement('option');
+          opt.value = n;
+          datalist.appendChild(opt);
+        }
+      }
+    }
+  }
+  return { nTours, nPersons, nImages: existingPhashes.length, nVideos: existingVhashes.length };
+}
+
+// Boot do catálogo NÃO bloqueia o seletor: quem já escolheu imagens espera
+// aqui (dedup e auto-detecção precisam dele).
+const catalogReady = loadCatalog().then((n) => {
+  $('#status').innerHTML = `<span class="ok">Pronto.</span> ${n.nTours} passeios, ${n.nPersons} pessoas, ${n.nImages} fotos e ${n.nVideos} vídeos no acervo.`;
+  return true;
+}).catch((e) => {
+  $('#status').innerHTML = `<span class="warn">Catálogo indisponível (${escapeHtml(e.message)}) — envio segue sem dedup/passeio.</span>`;
+  return false;
+});
+
+// ===================== Autora ===========================================
+// Nome digitado → pessoa do catálogo (casando apelido OU nome real, sem
+// acento/caixa) ou pessoa NOVA, mintada UMA vez por nome nesta sessão (todas
+// as imagens do lote apontam pro mesmo IRI). Lembrada no localStorage.
+const mintedByName = new Map();   // nome normalizado → { iri, name }
+function randPersonSlug(n = 8) {
+  const A = '0123456789abcdefghjkmnpqrstvwxyz';
+  const b = crypto.getRandomValues(new Uint8Array(n));
+  let s = '';
+  for (let i = 0; i < n; i++) s += A[b[i] & 31];
+  return s;
+}
+function resolveAuthor() {
+  const name = $('#author').value.trim();
+  try { localStorage.setItem(AUTHOR_KEY, name); } catch (_) {}
+  if (!name) return null;
+  const k = normName(name);
+  const known = personByName.get(k);
+  if (known) return { iri: known, decl: '' };
+  let minted = mintedByName.get(k);
+  if (!minted) {
+    minted = { iri: PES_NS + randPersonSlug(), name };
+    mintedByName.set(k, minted);
+  }
+  return {
+    iri: minted.iri,
+    decl: `<${minted.iri}> a schema:Person ;\n    schema:alternateName "${turtle_escape(minted.name)}" .\n`,
+  };
+}
+try { $('#author').value = localStorage.getItem(AUTHOR_KEY) || ''; } catch (_) {}
+
+// ===================== Pré-processamento ================================
+// Foto: decode → pHash → (miniatura ∥ EXIF). Vídeo: vHash → (GPS ∥ data ∥
+// duração ∥ miniatura). Nenhum dos dois toca o DOM — falha vira exceção e o
+// consumidor sequencial marca a célula.
+const heicLimit = makeLimiter(2);
+async function preprocessImageFile(file) {
+  const originalFile = file;
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  } catch (nativeErr) {
+    if (!isHeicFile(file)) throw new Error(`não consegui ler (${nativeErr.message})`);
+    if (!heic2any) await heic2anyReady();
+    if (!heic2any) throw new Error('HEIC precisa do heic2any (indisponível) — tente pelo Safari');
+    const out = await heicLimit(() => heic2any({ blob: file, toType: 'image/jpeg', quality: 0.92 }));
+    const blob = Array.isArray(out) ? out[0] : out;
+    file = new File([blob], file.name.replace(/\.(heic|heif)$/i, '.jpg'), { type: 'image/jpeg' });
+    bitmap = await createImageBitmap(file, { imageOrientation: 'from-image' });
+  }
+  try {
+    const phash = computePHash(bitmap);
+    const [thumbBlob, exif] = await Promise.all([
+      makeThumbnail(bitmap),
+      (async () => {
+        if (!exifr) return null;
+        try { return await exifr.parse(originalFile, { gps: true }); }
+        catch (e) { console.warn('EXIF parse:', e); return null; }
+      })(),
+    ]);
+    return { kind: 'image', file, phash, thumbBlob, exif };
+  } finally {
+    try { bitmap.close?.(); } catch (_) {}
+  }
+}
+async function preprocessVideoFile(file) {
+  const phash = await computeVideoPHash(file, 8);
+  const [gps, dateLocal, duration, thumbBlob] = await Promise.all([
+    tryExtractVideoGps(file).catch(() => null),
+    tryExtractVideoCreationDate(file).catch(() => null),
+    probeVideoDuration(file),
+    videoFirstFrameBlob(file).catch(() => null),
+  ]);
+  if (duration <= 0.1) throw new Error('vídeo curto demais (ou sem duração)');
+  if (duration > 600.5) throw new Error('vídeo > 10 min — recorte no formulário completo');
+  return { kind: 'video', file, phash, thumbBlob, gps, dateLocal, duration };
+}
+
+function detectTour(ms) {
+  if (!Number.isFinite(ms) || !tourCatalog.length) return null;
+  const matches = tourCatalog.filter(t =>
+    ms >= t.ms - TOUR_WINDOW_BEFORE_MS && ms <= t.ms + TOUR_WINDOW_AFTER_MS);
+  if (!matches.length) return null;
+  matches.sort((a, b) => Math.abs(ms - a.ms) - Math.abs(ms - b.ms));
+  return matches[0];
+}
+
+// ===================== TTL ==============================================
+const PREFIXES = [
+  '@prefix dcterms: <http://purl.org/dc/terms/> .',
+  '@prefix exif:    <http://www.w3.org/2003/12/exif/ns#> .',
+  '@prefix nfo:     <http://www.semanticdesktop.org/ontologies/2007/03/22/nfo#> .',
+  '@prefix pav:     <http://purl.org/pav/> .',
+  '@prefix ph:      <https://id.pedalhidrografi.co/terms#> .',
+  '@prefix pes:     <https://id.pedalhidrografi.co/pessoas/> .',
+  '@prefix med:     <https://id.pedalhidrografi.co/midia/> .',
+  '@prefix prov:    <http://www.w3.org/ns/prov#> .',
+  '@prefix schema:  <https://schema.org/> .',
+  '@prefix xsd:     <http://www.w3.org/2001/XMLSchema#> .',
+].join('\n');
+
+function originalFormat(file) {
+  const raw = (file.name.match(/\.([a-z0-9]+)$/i)?.[1] || 'jpg').toLowerCase();
+  if (raw === 'png')  return { ext: 'png',  mime: 'image/png'  };
+  if (raw === 'heic') return { ext: 'heic', mime: 'image/heic' };
+  if (raw === 'heif') return { ext: 'heif', mime: 'image/heif' };
+  return { ext: 'jpg', mime: 'image/jpeg' };
+}
+// Props comuns a foto e vídeo: data (+ passeio detectado), GPS, autora.
+function commonProps(item, author, { dateLocal, tzOverride, lat, lon }) {
+  const id = `med:${item.phash}`;
+  const props = [], derived = [];
+  const hasGeo = Number.isFinite(lat) && Number.isFinite(lon);
+  let dateXsd = null;
+  item.tour = null;
+  if (dateLocal) {
+    const d = new Date(dateLocal);
+    if (!isNaN(d)) {
+      dateXsd = localToXsdDateTime(dateLocal, tzOverride || null);
+      item.tour = detectTour(d.getTime());
+    }
+  }
+  if (dateXsd)  props.push(`dcterms:date "${dateXsd}"^^xsd:dateTime`);
+  if (hasGeo) {
+    props.push(`schema:locationCreated ${id}_geo`);
+    derived.push(
+      `${id}_geo a schema:GeoCoordinates ;\n` +
+      `    schema:latitude "${lat.toFixed(6)}"^^xsd:decimal ;\n` +
+      `    schema:longitude "${lon.toFixed(6)}"^^xsd:decimal .`);
+  }
+  if (item.tour) props.push(`ph:capturedDuring <${item.tour.iri}>`);
+  if (author) {
+    props.push(`prov:wasAttributedTo <${author.iri}>`);
+    props.push(`pav:providedBy <${author.iri}>`);
+  }
+  return { id, hasGeo, props, derived };
+}
+function assembleTtl(id, typeLine, props, derived, author) {
+  const body = [typeLine, ...props].map(p => `    ${p}`).join(' ;\n');
+  const decls = author?.decl ? `\n# Pessoa nova\n${author.decl}` : '';
+  return `${PREFIXES}\n${decls}\n${id}\n${body} .\n\n${derived.join('\n\n')}\n`;
+}
+function buildImageTtl(item, author) {
+  const { exif, file, phash } = item;
+  const d = exif?.DateTimeOriginal ? new Date(exif.DateTimeOriginal) : null;
+  const { id, hasGeo, props, derived } = commonProps(item, author, {
+    dateLocal: d && !isNaN(d) ? dateToLocalInput(d) : null,
+    tzOverride: exif?.OffsetTimeOriginal,
+    lat: exif?.latitude, lon: exif?.longitude,
+  });
+  const own = [`nfo:hasHash ${id}_hash`, `dcterms:license <${LICENSE}>`];
+  if (exif?.GPSImgDirection != null && Number.isFinite(+exif.GPSImgDirection))
+    own.push(`exif:gpsImgDirection "${+exif.GPSImgDirection}"^^xsd:decimal`);
+  if (exif?.FocalLengthIn35mmFormat != null && Number.isFinite(+exif.FocalLengthIn35mmFormat) && +exif.FocalLengthIn35mmFormat > 0)
+    own.push(`exif:focalLengthIn35mmFilm "${+exif.FocalLengthIn35mmFormat}"^^xsd:decimal`);
+  const { ext, mime } = originalFormat(file);
+  if (ext !== 'jpg') own.push(`schema:encodingFormat "${mime}"`);
+  derived.unshift(
+    `${id}_hash a nfo:FileHash ;\n` +
+    `    nfo:hashAlgorithm "pHash" ;\n` +
+    `    nfo:hashValue "${phash}" .`);
+  return assembleTtl(id, `a ph:StillImage${hasGeo ? ', ph:GeoreferencedImage' : ''}`, [...own, ...props], derived, author);
+}
+// Espelha buildClipBlock do form completo: clipe inteiro, 360p sempre, 720p
+// só se o blob existe (HD ligado E o motor produziu), áudio à parte.
+function buildVideoTtl(item, author, result) {
+  const { id, hasGeo, props, derived } = commonProps(item, author, {
+    dateLocal: item.dateLocal, lat: item.gps?.lat, lon: item.gps?.lng,
+  });
+  const vid = item.phash;
+  const isoDur = `PT${Math.round(item.duration * 100) / 100}S`;
+  const own = [
+    `dcterms:license <${LICENSE}>`,
+    `schema:duration "${isoDur}"^^xsd:duration`,
+    `ph:audio "${vid}.audio.webm"`,
+    `schema:thumbnail "${vid}.thumb.jpg"`,
+    `ph:video360p "${vid}.360p.webm"`,
+  ];
+  const res = ['"audio"', '"360p"'];
+  if (result.blob720) { own.push(`ph:video720p "${vid}.720p.webm"`); res.push('"720p"'); }
+  own.push(`ph:availableResolution ${res.join(', ')}`);
+  return assembleTtl(id, `a ph:MotionImage${hasGeo ? ', ph:GeoreferencedImage' : ''}`, [...own, ...props], derived, author);
+}
+
+// Original preservado bit a bit; large = ≤500 kB com o EXIF copiado; thumb.
+async function buildVariants(item) {
+  const bitmap = await createImageBitmap(item.file, { imageOrientation: 'from-image' });
+  try {
+    let largeBlob = await compressToTarget(bitmap, COMPRESS_TARGET_BYTES);
+    largeBlob = await copyExifSegment(item.file, largeBlob);
+    return {
+      original: { blob: item.file, name: `original.${originalFormat(item.file).ext}` },
+      large:    { blob: largeBlob, name: 'large.jpg' },
+      thumb:    { blob: item.thumbBlob ?? await makeThumbnail(bitmap), name: 'thumb.jpg' },
+    };
+  } finally {
+    try { bitmap.close(); } catch (_) {}
+  }
+}
+
+// ===================== UI por imagem ====================================
+function addItem(file) {
+  const li = document.createElement('li');
+  li.className = 'is-busy';
+  li.innerHTML = `<div class="th"><div class="noimg"></div></div><span class="st">lendo…</span><span class="nm"></span>`;
+  $('.nm', li).textContent = file.name;
+  $('#grid').appendChild(li);
+  return { file, li };
+}
+function setThumb(item, blob) {
+  if (!blob) return;
+  const img = document.createElement('img');
+  img.alt = '';
+  img.src = URL.createObjectURL(blob);
+  img.onload = () => URL.revokeObjectURL(img.src);
+  $('.noimg', item.li)?.replaceWith(img);
+  if (item.kind === 'video') {
+    const b = document.createElement('span');
+    b.className = 'badge'; b.textContent = '▶';
+    $('.th', item.li).appendChild(b);
+  }
+}
+function setState(item, cls, html) {
+  item.li.classList.remove('is-busy', 'is-ok', 'is-err', 'is-dup');
+  if (cls) item.li.classList.add(cls);
+  $('.st', item.li).innerHTML = html;
+}
+function notifyParent(kind, hash) {
+  try {
+    if (window.parent !== window)
+      window.parent.postMessage({ type: 'phidro-media-changed', kind, hash }, location.origin);
+  } catch (_) {}
+}
+
+// ===================== Envio =============================================
+async function postMedia(item, url, fd) {
+  setState(item, 'is-busy', 'enviando…');
+  try {
+    const res = await fetch(url, { method: 'POST', body: fd });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = (data.details || []).join('; ') || data.error || `HTTP ${res.status}`;
+      setState(item, 'is-err', `erro: ${escapeHtml(detail)}`);
+      return 'err';
+    }
+    return 'ok';
+  } catch (e) {
+    setState(item, 'is-err', `erro de rede: ${escapeHtml(e.message)}`);
+    return 'err';
+  }
+}
+function markSent(item, extra = '') {
+  const where = item.tour ? escapeHtml(item.tour.title) : 'sem passeio';
+  setState(item, 'is-ok', `✓ enviada · ${where}${extra}`);
+  addItemActions(item);
+}
+
+// ✎ editar / 🗑 excluir por imagem enviada — os mesmos caminhos do popup do
+// mapa e da galeria: edição no formulário completo (?edit=<iri>), exclusão
+// via POST /delete-image|/delete-video (apaga triples E arquivos).
+function addItemActions(item) {
+  const acts = document.createElement('div');
+  acts.className = 'acts';
+  const edit = document.createElement('button');
+  edit.type = 'button'; edit.textContent = '✎'; edit.title = 'Editar (formulário completo)';
+  const del = document.createElement('button');
+  del.type = 'button'; del.className = 'danger'; del.textContent = '🗑'; del.title = 'Excluir';
+  acts.append(edit, del);
+  item.li.appendChild(acts);
+  const iri = MED_NS + item.phash;
+  edit.addEventListener('click', () => {
+    const url = `./upload_images.html?edit=${encodeURIComponent(iri)}`;
+    // No modal do app o iframe navega pro form de edição (o app já trata
+    // esse caminho); standalone abre em aba nova pra não perder a grade.
+    if (EMBEDDED) location.href = url; else window.open(url, '_blank', 'noopener');
+  });
+  del.addEventListener('click', async () => {
+    if (!confirm(`Excluir ${item.file.name} do acervo? Isso remove arquivos e triples e não pode ser desfeito.`)) return;
+    edit.disabled = del.disabled = true;
+    const url = item.kind === 'video' ? `./delete-video/${item.phash}` : `./delete-image/${item.phash}`;
+    try {
+      const res = await fetch(url, { method: 'POST' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      edit.disabled = del.disabled = false;
+      setState(item, 'is-err', `exclusão falhou: ${escapeHtml(e.message)}`);
+      item.li.appendChild(acts);   // setState não mexe nos botões; mantém
+      return;
+    }
+    // Some das listas de dedup: pode ser reenviada nesta mesma sessão.
+    for (const arr of [existingPhashes, existingVhashes, batchHashes]) {
+      const i = arr.indexOf(item.phash); if (i >= 0) arr.splice(i, 1);
+    }
+    acts.remove();
+    setState(item, 'is-dup', 'excluída');
+    notifyParent(item.kind === 'video' ? 'delete-video' : 'delete-image', item.phash);
+  });
+}
+
+const uploadLimit = makeLimiter(3);
+async function uploadImageItem(item, author) {
+  setState(item, 'is-busy', 'preparando…');
+  let ttl, variants;
+  try {
+    ttl = buildImageTtl(item, author);
+    variants = await buildVariants(item);
+  } catch (e) {
+    setState(item, 'is-err', `erro: ${escapeHtml(e.message)}`);
+    return 'err';
+  }
+  const fd = new FormData();
+  fd.append('ttl', ttl);
+  fd.append('original', variants.original.blob, variants.original.name);
+  fd.append('large',    variants.large.blob,    variants.large.name);
+  fd.append('thumb',    variants.thumb.blob,    variants.thumb.name);
+  const r = await postMedia(item, './upload-image', fd);
+  if (r === 'ok') {
+    existingPhashes.push(item.phash);   // re-escolher nesta sessão = duplicada
+    markSent(item);
+    notifyParent('upload-image', item.phash);
+  }
+  return r;
+}
+
+// Um transcode por vez (dois em máquinas com ≥ 8 threads) — mesmo teto do
+// form completo: cada um é um decoder de hardware + 2 encoders.
+const TRANSCODE_POOL = makeLimiter((navigator.hardwareConcurrency || 2) >= 8 ? 2 : 1);
+async function uploadVideoItem(item, author) {
+  let result;
+  try {
+    setState(item, 'is-busy', 'na fila pra transcodar…');
+    let engine = '';
+    result = await TRANSCODE_POOL(() => processClipFile(item.file,
+      { tStart: 0, tEnd: item.duration, audioOnly: false, hd: WANT_HD },
+      { onEngine: (l) => { engine = l; setState(item, 'is-busy', `transcodando (${l})…`); },
+        onProgress: (f) => setState(item, 'is-busy', `transcodando (${engine})… ${Math.round(f * 100)}%`) }));
+  } catch (e) {
+    setState(item, 'is-err', isAbortError(e) ? 'cancelado' : `erro: ${escapeHtml(e.message)}`);
+    return 'err';
+  }
+  const vid = item.phash;
+  const fd = new FormData();
+  fd.append('ttl', buildVideoTtl(item, author, result));
+  fd.append('id', vid);
+  fd.append('audio', result.audio, `${vid}.audio.webm`);
+  const thumb = result.thumb || item.thumbBlob;
+  if (thumb) fd.append('thumb', thumb, `${vid}.thumb.jpg`);
+  if (result.blob360) fd.append('video360', result.blob360, `${vid}.360p.webm`);
+  if (result.blob720) fd.append('video720', result.blob720, `${vid}.720p.webm`);
+  const r = await postMedia(item, './upload-video', fd);
+  if (r === 'ok') {
+    existingVhashes.push(vid);
+    markSent(item, ` (${result.engine})`);
+    notifyParent('upload-video', vid);
+  }
+  return r;
+}
+
+// ===================== Wake lock (lotes grandes / vídeo) =================
+let _wakeLock = null;
+async function withWakeLock(fn) {
+  try { _wakeLock = await navigator.wakeLock?.request?.('screen'); } catch (_) {}
+  try { return await fn(); }
+  finally { try { await _wakeLock?.release(); } catch (_) {} _wakeLock = null; }
+}
+
+// ===================== Seleção = envio ===================================
+const PREPROCESS_POOL = Math.min(4, navigator.hardwareConcurrency || 2);
+// Vídeo pré-processa UM por vez: o pipeline seeka <video>s escondidos e é
+// sensível a concorrência (mesma razão do form completo).
+const videoPre = makeLimiter(1);
+const _pickQueue = [];
+const batchHashes = [];   // pHash/vHash já aceitos nesta sessão (dedup intra-lote, espaço comum)
+
+async function handlePickedFiles(files) {
+  if (pickerBusy) { _pickQueue.push(files); return; }
+  pickerBusy = true;
+  $('#picker').classList.add('busy');
+  try {
+    const tally = { ok: 0, dup: 0, err: 0, skip: 0 };
+    const media = files.filter(f => isVideoFile(f) || (f.type || '').startsWith('image/') || isHeicFile(f));
+    tally.skip = files.length - media.length;
+    const items = media.map(addItem);
+    const hasVideo = media.some(isVideoFile);
+    const author0 = resolveAuthor();   // lido UMA vez por lote (o campo pode mudar no meio)
+    const run = async () => {
+      const catalogOk = await catalogReady;
+      const limit = makeLimiter(PREPROCESS_POOL);
+      const pre = items.map(it => isVideoFile(it.file)
+        ? videoPre(() => preprocessVideoFile(it.file))
+        : limit(() => preprocessImageFile(it.file)));
+      const uploads = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        $('#status').textContent = `lendo ${i + 1}/${items.length}…`;
+        let r;
+        try { r = await pre[i]; }
+        catch (e) { setState(item, 'is-err', `erro: ${escapeHtml(e.message)}`); tally.err++; continue; }
+        Object.assign(item, r);
+        setThumb(item, r.thumbBlob);
+        // Dedup: lote/sessão primeiro, depois servidor (Hamming ≤ 5), no
+        // espaço de hashes da mesma classe (foto↔foto, vídeo↔vídeo).
+        const dupIn = (arr) => arr.find(h => hammingDistance(r.phash, h) <= PHASH_DUP_THRESHOLD);
+        const server = item.kind === 'video' ? existingVhashes : existingPhashes;
+        if (dupIn(batchHashes)) { setState(item, 'is-dup', 'duplicada (já no lote)'); tally.dup++; continue; }
+        if (catalogOk && dupIn(server)) { setState(item, 'is-dup', 'já está no acervo'); tally.dup++; continue; }
+        batchHashes.push(r.phash);
+        // Autora: se a pessoa foi MINTADA, o 1º envio do lote a declara e os
+        // demais repetem a mesma declaração (união idempotente no servidor).
+        const send = item.kind === 'video'
+          ? () => uploadVideoItem(item, author0)
+          : () => uploadLimit(() => uploadImageItem(item, author0));
+        uploads.push(send().then(k => { tally[k]++; }));
+        await new Promise(res => setTimeout(res));   // deixa o navegador pintar
+      }
+      $('#status').textContent = `enviando…`;
+      await Promise.all(uploads);
+    };
+    if (media.length > 5 || hasVideo) await withWakeLock(run); else await run();
+    const parts = [];
+    if (tally.ok)   parts.push(`<span class="ok">${plural(tally.ok, 'imagem enviada', 'imagens enviadas')}</span>`);
+    if (tally.dup)  parts.push(`<span class="warn">${plural(tally.dup, 'duplicada', 'duplicadas')}</span>`);
+    if (tally.err)  parts.push(`<span class="err">${tally.err} com erro</span>`);
+    if (tally.skip) parts.push(`<span class="warn">${plural(tally.skip, 'arquivo ignorado', 'arquivos ignorados')} (só imagens e vídeos)</span>`);
+    $('#status').innerHTML = parts.length ? parts.join(' · ') + '.' : 'nada a enviar.';
+  } finally {
+    pickerBusy = false;
+    $('#picker').classList.remove('busy');
+    const next = _pickQueue.shift();
+    if (next) handlePickedFiles(next);
+  }
+}
+
+// Listener real (substitui o provisório do topo) + seleções feitas antes do boot.
+$('#files').addEventListener('change', (e) => {
+  const files = [...e.target.files];
+  e.target.value = '';
+  if (files.length) handlePickedFiles(files);
+});
+{
+  const early = (window._phidroEarlyPicks || []).splice(0);
+  window._phidroEarlyPicks = null;
+  for (const files of early) handlePickedFiles(files);
+}
+</script>
+</body>
+</html>

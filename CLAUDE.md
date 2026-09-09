@@ -28,6 +28,8 @@ one optional hosted deploy target, not a dependency.
   `streamFgbFeatures`), then that same FGB's lines rasterized into a
   ~30 m grid mask (`rasterizeRoads`). **There is no Overpass anywhere
   any more** — see "OSM layers come from FlatGeobuf" below),
+  `media-pipeline.js` (módulo ES com o pipeline de mídia do `upload_images.html`,
+  consumido por `subir.html` — ver acima),
   `flatgeobuf-geojson.min.js` (FGB reader, flatgeobuf 4.4.0),
   `tom-select.complete.min.js`,
   `tom-select.min.css`, `qrcode.js`, `leaflet/` (js+css+images),
@@ -39,6 +41,17 @@ one optional hosted deploy target, not a dependency.
   promise). Leaflet-based map. Also hosts `upload_images.html` (per-photo upload
   form), `upload_tour.html` (per-tour upsert form),
   `backfill_tours.html` (mass-backfill applet for missing tour fields),
+  `subir.html` (**envio simplificado**, servido em `/subir` e no modal do
+  botão **📤 enviar imgs** da barra — só autora opcional + imagens (fotos,
+  vídeos, artes), que sobem ao serem escolhidas; tudo o mais é o default do
+  `upload_images.html`: mesmos `POST /upload-image` / `/upload-video` (vídeo
+  inteiro, sem recorte nem pré-envio), mesma dedup por pHash/vHash; cada
+  imagem enviada ganha ✎ editar (abre `upload_images.html?edit=`) / 🗑
+  excluir. O pipeline vem de `lib/media-pipeline.js` — **CÓPIA VERBATIM dos
+  helpers do form completo** (pHash/vHash, variantes, EXIF, moov, motores de
+  transcodificação), gerada por marcador de função; o form completo NÃO
+  importa de lá ainda — mexeu num helper lá, regenere o módulo, senão os dois
+  forms divergem e a dedup quebra),
   `censo.html` (aggregated tour metrics + roster, opened as a modal
   iframe from the main app), `upload_videos.html` (permanent redirect
   stub → `upload_images.html`), and the `data/`, `photos/`, `clips/`,
@@ -182,7 +195,25 @@ one optional hosted deploy target, not a dependency.
   partir da gravação GPS — **atenção: a gravação inclui o trajeto de casa até
   o ponto de encontro; a janela do passeio é um SUBCONJUNTO dela.** No PH/81 a
   gravação inteira dá 927 kJ contra os 328 kJ reais do pedal),
-  `ingest-drive.py` (fase 1 da ingestão do acervo: só os originais com EXIF/GPS),
+  `ingest-drive.py` (fase 1 da ingestão do acervo: só os originais com
+  EXIF/GPS — os 2 achados críticos da revisão de 07/2026 foram corrigidos em
+  09/2026: GPS 0/0 é rejeitado (`gps_valido`) e large/thumb saem convertidos
+  pra sRGB (`para_srgb`, sem copiar o ICC de volta); dedup só contra fotos;
+  rede com certifi + UA próprio), `ingest-whatsapp.py` (**fase 2**: os
+  ~6.400 JPEGs + ~1.300 MP4s do WhatsApp, sem EXIF — entram como
+  `ph:StillImage` SEM `ph:GeoreferencedImage` (nunca viram marcador),
+  `dcterms:date` = data/hora DO PASSEIO (`ph:departedAt` ou a do tour),
+  `schema:datePublished` = carimbo de compartilhamento do nome do arquivo,
+  `schema:creditText` = slug cru de quem compartilhou (join via
+  `schema:alternateName`, como o `ph:sweepContributor`), e
+  `pav:providedBy` + `prov:wasAttributedTo` só quando o
+  `whatsapp-slug-map.json` resolve a pessoa; vídeos (`--videos`) via ffmpeg —
+  vhash de 8 quadros como o form, audio.webm + 360p.webm + thumb, sem 720p;
+  rode a fase 1 ANTES: a cópia do zap deduplica contra o original por Hamming
+  e a versão com GPS vence). **Os dois pré-baixam os stubs do Drive em
+  paralelo** (`prewarm`, 32 threads): lidos um a um materializam a ~250 KB/s
+  (latência por arquivo), em paralelo ~5× mais; `ingest-whatsapp` pré-baixa
+  em lotes de 256),
   `migrate-captura-fixes.py` (reparos de catálogo: arte em host local, datatype
   de `ph:sequenceInSeries`),
   `migrate-date-offsets.py` (one-shot: repara os offsets UTC das
@@ -560,6 +591,20 @@ Key flows:
   "Censo →" sidebar link in the Routes panel — and the iframe is
   re-pointed to `./censo.html` on every open so navigating into the edit
   form internally doesn't strand the user there on re-open.
+- **`/data/images-geo.ttl` é a fatia que o MAPA carrega.** `app.js` só usa
+  mídia com coordenada, mas baixava e parseava o `images.ttl` inteiro DUAS
+  vezes por boot (manifesto + `loadClipsFromUploadsTtl`) e descartava o
+  resto — com a fase 2 da ingestão (~7.500 fotos sem GPS) o dump cresce ~10×.
+  `_images_geo_text()` deriva do snapshot: mídia com `schema:locationCreated`
+  ou `ph:GeoreferencedImage` + nós `<iri>_*` + closure de bnodes + os `env:`
+  `ph:Upload` que a geraram; cache por digest do texto do `images.ttl`
+  (padrão do `_tours_graph`), servida por `get_data_ttl` com o mesmo
+  ETag/gzip. **É derivada — nunca vai pro bucket nem entra em
+  `CATALOG_DUMPS`** (duplicaria as triples no universo SHACL). O manifesto
+  VoID segue listando o `images.ttl` completo (galeria, censo, pessoas,
+  memória e agentes precisam do resto); `loadAllGraphs` troca a URL no
+  cliente, e o SW trata `images-geo.ttl` como network-first. Um kit local
+  exportado carrega a fatia geo (o que o mapa mostra).
 - **Backend endpoint summary.** Static: `GET /` (deep links `?tour=<id>`
   — slug8, slug legível ou id numérico legado — 303am pra URL canônica
   `/passeio/<slug legível ou slug8>`; id desconhecido degrada pro index
@@ -573,7 +618,9 @@ Key flows:
   to the bucket's public URL), `GET /feed.xml` (RSS 2.0 dos passeios,
   renderizado de `tours.ttl` e cacheado por hash do catálogo — atualiza
   sozinho a cada tour CRUD; link do item = IG, senão a página do passeio),
-  `GET /sitemap.xml` (dinâmico, sobrepõe o
+  `GET /memoria` (a Memória Hidrográfica SSR'ada — URL canônica desde a v404;
+  `/memoria.html` faz 301 pra cá preservando a query, as âncoras `#<slug8>`
+  seguem funcionando), `GET /sitemap.xml` (dinâmico, sobrepõe o
   estático: home + `/passeio/<slug legível ou slug8>` por passeio — o app
   abre no modal da rota — com bloco Google News pros passeios das últimas
   48 h; cache por hash + TTL de 1 h). Ops: `GET /health`, `POST /reload`

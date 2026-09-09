@@ -185,8 +185,20 @@ body.header-hidden .leaflet-top {
   .topbar-actions { gap: 4px; }
   .topbar-actions .secondary-btn { padding: 6px 8px; font-size: 12px; }
 }
-.topbar-actions button {
+.topbar-actions button,
+.topbar-actions a.secondary-btn {
   flex: 0 0 auto;
+}
+/* Link vestido de botão (🕰 memória): mesma fonte de controle que os <button>
+   (que NÃO herdam a mono do body), sem sublinhado, caixa igual. */
+.topbar-actions a.secondary-btn {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;   /* mesma altura dos <button> vizinhos (o emoji alonga a linha deles) */
+  box-sizing: border-box;
+  text-decoration: none;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  line-height: normal;
 }
 
 /* Em telas estreitas (celular em retrato e similares), o .topbar-actions ocupa

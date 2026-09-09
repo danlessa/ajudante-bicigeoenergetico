@@ -18,7 +18,7 @@
 // origin) e v371/v372 saíram na `deploy` (busca de endereços, ⇄ inverter).
 // v373 fica acima de tudo que já circulou, que é o que importa: se a VERSION
 // não crescer, o service worker serve cache velho.
-const VERSION = 'phidro-v400';
+const VERSION = 'phidro-v404';
 const STATIC_CACHE = `${VERSION}-static`;
 const RUNTIME_CACHE = `${VERSION}-runtime`;
 
@@ -145,6 +145,7 @@ self.addEventListener('fetch', (event) => {
         || url.pathname.endsWith('/data/uploads.ttl')
         || url.pathname.endsWith('/data/tours.ttl')
         || url.pathname.endsWith('/data/images.ttl')
+        || url.pathname.endsWith('/data/images-geo.ttl')
         || url.pathname.endsWith('/data/identities.ttl')
         || url.pathname.endsWith('/data/lists.ttl')
         || url.pathname.endsWith('/routes.json')

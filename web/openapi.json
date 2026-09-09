@@ -93,7 +93,7 @@
         "responses": {"200": {"$ref": "#/components/responses/Negotiated"}}
       }
     },
-    "/memoria.html": {
+    "/memoria": {
       "get": {
         "tags": ["páginas"],
         "summary": "Memória Hidrográfica — a linha do tempo de todos os passeios",
@@ -107,7 +107,7 @@
         "tags": ["dados"],
         "summary": "Dumps RDF (Turtle) — o acervo inteiro",
         "description": "`data_graphs.ttl` é o manifesto VoID (ponto de entrada; lista os dumps via `void:dataDump`). `tours.ttl` = passeios, séries e edições; `images.ttl` = fotos e vídeos; `identities.ttl` = pessoas; `lists.ttl` = listas/álbuns; `ontology.ttl` = vocabulário; `shapes.ttl` = SHACL. Respostas com ETag (revalidação barata) e `X-Robots-Tag: noindex`.",
-        "parameters": [{"name": "filename", "in": "path", "required": true, "schema": {"type": "string", "enum": ["data_graphs.ttl", "tours.ttl", "images.ttl", "identities.ttl", "lists.ttl", "ontology.ttl", "shapes.ttl"]}}],
+        "parameters": [{"name": "filename", "in": "path", "required": true, "schema": {"type": "string", "enum": ["data_graphs.ttl", "tours.ttl", "images.ttl", "images-geo.ttl", "identities.ttl", "lists.ttl", "ontology.ttl", "shapes.ttl"]}}],
         "responses": {"200": {"description": "Turtle.", "content": {"text/turtle": {"schema": {"type": "string"}}}}, "404": {"description": "Arquivo desconhecido."}}
       }
     },

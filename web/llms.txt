@@ -25,7 +25,7 @@ Fatos rápidos:
 - **Toda página responde em Markdown**: `Accept: text/markdown` (ou `?format=md`)
   devolve a mesma URL em Markdown limpo, sem o chrome do app — a home (este
   guia + os passeios recentes), `/passeio/<slug>` (narrativa + ficha),
-  `/memoria.html` (todos os passeios), `/serie/<código>`, `/pessoas/<slug>`,
+  `/memoria` (todos os passeios), `/serie/<código>`, `/pessoas/<slug>`,
   `/midia/<hash>`, `/listas/<slug>` e `/terms`. HTML continua o padrão pra
   `*/*` e `text/html`. As respostas trazem `x-markdown-tokens` (estimativa) e
   `Content-Signal`.
@@ -47,6 +47,7 @@ Fatos rápidos:
   (`ph:StillImage`) e vídeos (`ph:MotionImage`) georreferenciados — ambos
   subclasses de `ph:Image` (mídia visual) — com hash perceptual, autoria e
   associação ao passeio (`ph:capturedDuring`).
+- [images-geo.ttl](https://amora.pedalhidrografi.co/data/images-geo.ttl): só a mídia georreferenciada (a fatia que o mapa carrega; derivada do images.ttl, mesma forma)
 - [identities.ttl](https://amora.pedalhidrografi.co/data/identities.ttl): as
   pessoas (`schema:Person`) referenciadas por passeios e mídias — fonte única.
 - [lists.ttl](https://amora.pedalhidrografi.co/data/lists.ttl): as listas/álbuns
@@ -61,7 +62,7 @@ Fatos rápidos:
 
 - [Página principal](https://amora.pedalhidrografi.co/): o mapa (em Markdown:
   este guia + os passeios recentes).
-- [Memória Hidrográfica](https://amora.pedalhidrografi.co/memoria.html): todos
+- [Memória Hidrográfica](https://amora.pedalhidrografi.co/memoria): todos
   os passeios com narrativa, mais recentes primeiro (HTML ou Markdown).
 - [feed.xml](https://amora.pedalhidrografi.co/feed.xml): RSS 2.0 com os
   passeios mais recentes.

@@ -154,6 +154,8 @@ class PastaAcervo:
     # quem PRECISA do arquivo — o ingest-drive.py, que sobe esses ao amora. A
     # varredura segue lendo apenas METADADOS; ninguém abre nada aqui.
     originais_paths: list[tuple[Path, str | None]] = field(default_factory=list)
+    # Os do WhatsApp, idem — pro ingest-whatsapp.py (fase 2). Só metadados.
+    whatsapp_paths: list[tuple[Path, str | None]] = field(default_factory=list)
     bytes_: int = 0
     contribuintes: Counter = field(default_factory=Counter)
     mtime_max: float = 0.0
@@ -278,6 +280,7 @@ def _varre_midia(d: Path, p: PastaAcervo, subpasta: str | None) -> None:
         slug = _slug_do_arquivo(f.name, subpasta)
         if RE_WA.search(f.name):
             p.do_whatsapp += 1
+            p.whatsapp_paths.append((Path(f.path), slug))
         else:
             p.originais += 1
             p.originais_paths.append((Path(f.path), slug))
