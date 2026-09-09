@@ -583,9 +583,23 @@ pas:74d4aa50 a ph:Tour ;
     dcterms:description "Para os Mbyá-Guarani, os rios e as montanhas têm vida, são sujeitos e são sagrados. Nesta edição do Pedal Hidrográfico, as águas e morros que delineiam o relevo tocado por nossos pés nos guiarão até a cerimônia de celebração do ano novo guarani na Tekoa Yvyporã, localizada na Terra Indígena Jaraguá. Partiremos do Museu das Culturas Indígenas (próximo ao Parque Água Branca), cruzando os rios Sumaré, Água Preta, Cortume, Tiburtino, Fortunato Ferraz, Tietê, passando a surfar então pelos contra-rios: Colina do Anastácio, Desmorrodouro de Pirituba e Sopé do Planalto de Taipas, até avistarmos o Ribeirão Vermelho, águas que sinalizam a chegada ao nosso destino: a Tekoa Yvyporã. Lá, teremos a oportunidade de vivenciar a cerimônia e provar um almoço típico da aldeia."@pt ;
     dcterms:title "Ano novo guarani na Tekoa Yvyporã" ;
     prov:wasAttributedTo pes:wgb9b5fe ;
+    ph:arrivalLocation "Tekoa Yvi Porã" ;
+    ph:arrivedAt "2026-09-06T09:13:00-03:00"^^xsd:dateTime ;
+    ph:countAttendee 23 ;
+    ph:countNewcomer 7 ;
+    ph:departedAt "2026-09-06T07:34:00-03:00"^^xsd:dateTime ;
+    ph:departureLocation "Museu Indigena" ;
     ph:energyEstimate 279.0 ;
+    ph:hadIncident "1x furo"@pt ;
+    ph:hadRain true ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/111> ;
+    ph:linkActivity "https://ridewithgps.com/trips/410991439"^^xsd:anyURI,
+        "https://www.strava.com/activities/20060591993"^^xsd:anyURI,
+        "https://www.strava.com/activities/20064428460#kudos"^^xsd:anyURI ;
+    ph:linkInstagram "https://www.instagram.com/p/DczoH7ru6ju/"^^xsd:anyURI ;
     ph:linkRoute pas:74d4aa50_route ;
+    ph:measuredEnergy 268.0 ;
+    ph:movingDuration "PT1H17M"^^xsd:duration ;
     schema:identifier "ano-novo-guarani-na-tekoa-yvypora" ;
     schema:image <https://storage.googleapis.com/phidro-state/tour_assets/74d4aa50/announcement.jpg> .
 
@@ -1002,6 +1016,7 @@ pas:bp49gw62 a ph:Tour ;
     dcterms:title "Hidroviagem! Bertioga" ;
     prov:wasAttributedTo pes:wgb9b5fe ;
     ph:countAttendee 16 ;
+    ph:countNewcomer 3 ;
     ph:energyEstimate 855.0 ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/Hidroviagem/1> ;
     ph:linkRoute pas:bp49gw62_route ;
@@ -1762,6 +1777,8 @@ Tragam algo pra comer, se possível uma canga ou toalha e muita alegria. Viva a 
 Atenção! Vá com bicicleta revisada e use capacete. Leve água, protetor solar, algum lanchinho e câmara reserva."""@pt ;
     dcterms:title "Um piquenique para 100 pedais!" ;
     prov:wasAttributedTo pes:wgb9b5fe ;
+    ph:countAttendee 16 ;
+    ph:countNewcomer 2 ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/100> ;
     ph:linkInstagram "https://www.instagram.com/pedalhidrografico/p/DaoiebPDpyW/"^^xsd:anyURI ;
     ph:linkRoute pas:pjzp5vy4_route ;
@@ -2522,14 +2539,52 @@ pas:xzb05rn3 a ph:Tour ;
     ph:movingDuration "PT2H50M"^^xsd:duration ;
     schema:identifier "foz-do-tamanduatei-ate-sua-nascente" .
 
+pas:y1ash48j a ph:Tour ;
+    dcterms:date "2026-09-05T07:00:00-03:00"^^xsd:dateTime ;
+    dcterms:description """Em ocasião do 3º Desafio BioAves, buscaremos envolver o maior número de pessoas para contar o maior número possível de aves silvestres em vida livre no Parque Natural Municipal Cabeceiras do Aricanduva, parque este que ainda possui poucas listas de registros de aves no eBird.\r
+\r
+Neste pedal, vivenciaremos também como o transporte intermodal é fundamental para aproximar as pessoas de áreas verdes públicas: colocando as bicicletas no vagão, podemos ir mais longe em menos tempo."""@pt ;
+    dcterms:title "Cabeceiras do Aricanduva" ;
+    prov:wasAttributedTo pes:1fhkjnba,
+        pes:wgb9b5fe ;
+    ph:arrivalLocation "Parque Cabeceiras do Aricanduva" ;
+    ph:arrivedAt "2026-09-05T08:30:00-03:00"^^xsd:dateTime ;
+    ph:countAttendee 2 ;
+    ph:countNewcomer 0 ;
+    ph:departedAt "2026-09-05T07:38:00-03:00"^^xsd:dateTime ;
+    ph:departureLocation "Metro Jardim Colonial" ;
+    ph:energyEstimate 195.0 ;
+    ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/BP/8> ;
+    ph:linkActivity "https://ridewithgps.com/trips/410639751"^^xsd:anyURI,
+        "https://www.strava.com/activities/20050000520"^^xsd:anyURI ;
+    ph:linkInstagram "https://www.instagram.com/p/Dc34StzG_Sv/"^^xsd:anyURI ;
+    ph:linkRoute pas:y1ash48j_route ;
+    ph:measuredEnergy 212.0 ;
+    ph:movingDuration "PT41M"^^xsd:duration ;
+    schema:identifier "cabeceiras-do-aricanduva" ;
+    schema:image <https://storage.googleapis.com/phidro-state/tour_assets/y1ash48j/announcement.jpg> .
+
 pas:y3zptkf2 a ph:Tour ;
     dcterms:date "2026-09-02T20:00:00-03:00"^^xsd:dateTime ;
     dcterms:description "Essa rota é uma reedição do PH-83, um passeio pelas várzeas do rio Tamanduateí e Tietê à procura de prédios históricos e ruínas da São Paulo do início do século XX, importante palco do processo acelerado de industrialização da cidade."@pt ;
     dcterms:title "Reedição Ruínas" ;
+    ph:arrivalLocation "Estação da Luz" ;
+    ph:arrivedAt "2026-09-02T23:30:00-03:00"^^xsd:dateTime ;
+    ph:countAttendee 32 ;
+    ph:countNewcomer 9 ;
+    ph:departedAt "2026-09-02T20:30:00-03:00"^^xsd:dateTime ;
+    ph:departureLocation "Praça Ramos de Azevedo" ;
     ph:energyEstimate 286.0 ;
     ph:inSeriesEdition <https://id.pedalhidrografi.co/passeio/PH/109> ;
+    ph:linkActivity "https://www.strava.com/activities/20014303456"^^xsd:anyURI,
+        "https://www.strava.com/activities/20014319242"^^xsd:anyURI,
+        "https://www.strava.com/activities/20014404224"^^xsd:anyURI,
+        "https://www.strava.com/activities/20014501912"^^xsd:anyURI,
+        "https://www.strava.com/activities/20014537197"^^xsd:anyURI,
+        "https://www.strava.com/activities/20014605516"^^xsd:anyURI ;
     ph:linkInstagram "https://www.instagram.com/p/DcvvofwIDay/"^^xsd:anyURI ;
     ph:linkRoute pas:y3zptkf2_route ;
+    ph:movingDuration "PT2H"^^xsd:duration ;
     schema:identifier "reedicao-ruinas" ;
     schema:image <https://storage.googleapis.com/phidro-state/tour_assets/y3zptkf2/announcement.jpg> .
 
@@ -3113,6 +3168,10 @@ pas:9s8bhtjw_route a ph:RouteReference ;
 <https://id.pedalhidrografi.co/passeio/BP/6> a ph:SeriesEdition ;
     ph:inEventSeries ser:BP ;
     ph:sequenceInSeries 6 .
+
+<https://id.pedalhidrografi.co/passeio/BP/8> a ph:SeriesEdition ;
+    ph:inEventSeries ser:BP ;
+    ph:sequenceInSeries 8 .
 
 <https://id.pedalhidrografi.co/passeio/BT/1> a ph:SeriesEdition ;
     ph:inEventSeries ser:BT ;
@@ -4523,6 +4582,10 @@ pas:xzb05rn3_sweep a ph:MediaSweep ;
         "dandanlessa",
         "leoperandin",
         "sandronicodemo" .
+
+pas:y1ash48j_route a ph:RouteReference ;
+    schema:provider ph:amora ;
+    schema:url <https://amora.pedalhidrografi.co/route/cabeceiras-aricanduva> .
 
 pas:y3zptkf2_route a ph:RouteReference ;
     schema:provider ph:rwgps ;
